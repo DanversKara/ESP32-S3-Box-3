@@ -1,0 +1,3025 @@
+substitutions:
+  name: esp32-s3box-3
+  friendly_name: ESP32-S3-Box-3
+  friendly_name2: PLEASE WAIT
+  home_assistant_host: http://192.168.8.162:8123
+  api_key: !secret api_key
+  wifi_fallback_pwd: s3box123
+  voip_test_account_extension: !secret voip_test_account_extension
+  voip_test_account_password: !secret voip_test_account_password
+  ha_location_name: "Home Assistant"
+  settings_pin: !secret settings_pin
+  # PIN entered on the same keypad that toggles the front door lock and
+  # returns straight to the home page - kept completely separate from
+  # settings_pin above so it never grants access to the settings menu.
+  door_pin: !secret door_pin
+  #── Doorbell ────────────────────────────────────────────────────────────
+  # Extension the doorbell rings when the front-screen button (or the
+  # physical Home button as a fallback) is pressed.
+  doorbell_extension: "601"
+  # HA script entity toggled by "UNLOCK DOOR" in Settings.
+  door_lock_script_entity: script.toggle_front_door_lock
+  # HA light entity mirrored by the local backlight light below.
+  lcd_backlight_entity: light.esp32_s3_box_3_lcd_backlight
+
+external_components:
+  - source: github://eigger/espcomponents
+    components: [ sip_client ]
+  - source:
+      type: local
+      path: components
+    components: [ lvgl_screenshot ]
+
+lvgl_screenshot:
+  port: 8080
+  jpeg_quality: 100
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2024.8.0
+  project:
+    name: "kara_danvers.esp32-s3box-3"
+    version: "2.0.0"
+  on_boot:
+    priority: 600
+    then:
+      - audio_dac.mute_off: es8311_dac
+      - audio_dac.set_volume:
+          id: es8311_dac
+          volume: 85%
+      - audio_adc.set_mic_gain:
+          id: es7210_adc
+          mic_gain: !lambda 'return id(mic_gain_db);'
+      # Diagnostic only - prints whatever Available From/Until actually
+      # came back as right after flash-restore, before HA or anything
+      # else has had a chance to touch them. If these ever print
+      # something other than what you set, check the "on_value ->
+      # schedule time changed" log lines further down (fired on every
+      # change to either entity) to see what set it and when.
+      - lambda: |-
+          char buf[6];
+          snprintf(buf, sizeof(buf), "%02d:%02d", id(available_from).hour, id(available_from).minute);
+          ESP_LOGI("schedule", "Boot: Available From restored as %s", buf);
+          snprintf(buf, sizeof(buf), "%02d:%02d", id(available_until).hour, id(available_until).minute);
+          ESP_LOGI("schedule", "Boot: Available Until restored as %s", buf);
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+    advanced:
+      execute_from_psram: true
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+  fast_connect: true
+  ap:
+    ssid: ${name}
+    password: ${wifi_fallback_pwd}
+  on_connect:
+    - delay: 2s
+    - audio_dac.set_volume:
+        id: es8311_dac
+        volume: 85%
+    - audio_dac.mute_off: es8311_dac
+    - globals.set:
+        id: wifi_connected
+        value: 'true'
+    - script.execute: apply_dialpad_status
+    - script.execute: apply_wifi_status
+  on_disconnect:
+    - globals.set:
+        id: wifi_connected
+        value: 'false'
+    # Wi-Fi dropping also breaks the SIP registration (it doesn't survive a
+    # link loss), so treat it as lost until the client registers again.
+    - globals.set:
+        id: sip_registered
+        value: 'false'
+    - globals.set:
+        id: ha_connected
+        value: 'false'
+    - globals.set:
+        id: api_client_count
+        value: '0'
+    - script.execute: apply_dialpad_status
+    - script.execute: apply_home_status
+    - script.execute: apply_wifi_status
+
+captive_portal:
+
+api:
+  encryption:
+    key: ${api_key}
+  on_client_connected:
+    then:
+      - lambda: |-
+          id(api_client_count) += 1;
+          id(ha_connected) = true;
+      - script.execute: apply_home_status
+      - script.execute: apply_availability_status
+      - if:
+          condition:
+            lambda: 'return !id(boot_complete);'
+          then:
+            - globals.set:
+                id: boot_complete
+                value: 'true'
+            - lambda: |-
+                lv_label_set_text(id(boot_status_label), "Connected!");
+            - lambda: |-
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                lv_label_set_text(id(volume_percent_label), buf);
+                lv_label_set_text(id(incall_speaker_vol_label), buf);
+            - lambda: |-
+                char buf[12];
+                snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                lv_label_set_text(id(mic_gain_label), buf);
+                lv_label_set_text(id(incall_mic_gain_label), buf);
+            - lambda: |-
+                lv_label_set_text(id(doorbell_caption_label), id(door_caption_message).state.c_str());
+            - delay: 400ms
+            - globals.set:
+                id: current_page
+                value: '"home"'
+            - lvgl.page.show: home_page
+  on_client_disconnected:
+    then:
+      - lambda: |-
+          if (id(api_client_count) > 0) id(api_client_count) -= 1;
+          id(ha_connected) = (id(api_client_count) > 0);
+      - script.execute: apply_home_status
+
+ota:
+  platform: esphome
+
+time:
+  platform: sntp
+  id: sntp_time
+
+interval:
+  - interval: 30ms
+    then:
+      if:
+        condition:
+          lambda: 'return !id(boot_complete);'
+        then:
+          - lambda: |-
+              static int angle = 0;
+              angle = (angle + 6) % 360;
+              lv_arc_set_rotation(id(boot_spinner_arc), angle);
+  - interval: 450ms
+    then:
+      if:
+        condition:
+          lambda: 'return !id(boot_complete);'
+        then:
+          - lambda: |-
+              id(boot_dot_count) = (id(boot_dot_count) + 1) % 4;
+              std::string dots(id(boot_dot_count), '.');
+              std::string txt = "BOOTING" + dots;
+              lv_label_set_text(id(boot_status_label), txt.c_str());
+  - interval: 1s
+    then:
+      if:
+        condition:
+          lambda: 'return id(call_active);'
+        then:
+          - lambda: |-
+              id(call_seconds) += 1;
+              int m = id(call_seconds) / 60;
+              int s = id(call_seconds) % 60;
+              char buf[10];
+              snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+              lv_label_set_text(id(call_timer_label), buf);
+  - interval: 500ms
+    then:
+      if:
+        condition:
+          lambda: 'return id(call_in_progress);'
+        then:
+          - lambda: |-
+              // Pulsing amber "return to call" badge - the bg_color and
+              // shadow both breathe between a bright and dim amber so the
+              // glow looks like it's coming from behind the icon rather
+              // than just a flat blink.
+              lv_obj_clear_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);
+              id(call_return_blink) = !id(call_return_blink);
+              if (id(call_return_blink)) {
+                lv_obj_set_style_bg_color(id(call_return_btn), lv_color_hex(0xFFC107), 0);
+                lv_obj_set_style_shadow_color(id(call_return_btn), lv_color_hex(0xFFD65C), 0);
+                lv_obj_set_style_shadow_width(id(call_return_btn), 26, 0);
+                lv_obj_set_style_shadow_spread(id(call_return_btn), 6, 0);
+                lv_obj_set_style_shadow_opa(id(call_return_btn), 255, 0);
+              } else {
+                lv_obj_set_style_bg_color(id(call_return_btn), lv_color_hex(0xC9860A), 0);
+                lv_obj_set_style_shadow_color(id(call_return_btn), lv_color_hex(0xFFC107), 0);
+                lv_obj_set_style_shadow_width(id(call_return_btn), 12, 0);
+                lv_obj_set_style_shadow_spread(id(call_return_btn), 1, 0);
+                lv_obj_set_style_shadow_opa(id(call_return_btn), 140, 0);
+              }
+        else:
+          - lambda: |-
+              lv_obj_add_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);
+  # Blinks the "DOOR BELL UNAVAILABLE AT THIS TIME" overlay text between a
+  # bright and dim red only while it's actually showing (HA disconnected).
+  - interval: 600ms
+    then:
+      if:
+        condition:
+          lambda: 'return !id(ha_connected);'
+        then:
+          - lambda: |-
+              static bool bright = false;
+              bright = !bright;
+              uint32_t c = bright ? 0xE74C3C : 0x7A1F17;
+              lv_obj_set_style_text_color(id(doorbell_unavailable_label), lv_color_hex(c), 0);
+  # Red flicker glow on the doorbell button - randomized brightness/shadow
+  # every tick for a flickery glow effect. Runs whenever HA is connected;
+  # stops once disconnected since the unavailable overlay covers the
+  # button anyway. The label itself is now static ("APT" / "666" over a
+  # dimmed bell icon - see doorbell_icon_label/doorbell_press_label/
+  # doorbell_enter_label widgets), so this no longer touches label text.
+  - interval: 150ms
+    then:
+      if:
+        condition:
+          lambda: 'return id(ha_connected);'
+        then:
+          - lambda: |-
+              uint32_t rnd = random_uint32();
+              uint8_t r = 170 + (rnd % 86);
+              uint8_t r_dim = (r > 70) ? (r - 70) : r;
+              lv_obj_set_style_bg_color(id(doorbell_icon_btn), lv_color_hex((uint32_t)r << 16), 0);
+              lv_obj_set_style_shadow_color(id(doorbell_icon_btn), lv_color_hex((uint32_t)r_dim << 16), 0);
+              lv_obj_set_style_shadow_width(id(doorbell_icon_btn), 20 + (rnd % 26), 0);
+              lv_obj_set_style_shadow_spread(id(doorbell_icon_btn), 6, 0);
+              lv_obj_set_style_shadow_opa(id(doorbell_icon_btn), 130 + (rnd % 100), 0);
+  # Green digital-rain background for the home page - 12 tall columns of
+  # random digits scroll downward and wrap back to the top, with each
+  # column's digits reshuffled every so often for a flickering effect.
+  # Only runs while the home page is showing, to save CPU elsewhere.
+  - interval: 180ms
+    then:
+      if:
+        condition:
+          lambda: 'return id(current_page) == "home";'
+        then:
+          - lambda: |-
+              static lv_obj_t* cols[12] = {
+                id(matrix_col_0), id(matrix_col_1), id(matrix_col_2),
+                id(matrix_col_3), id(matrix_col_4), id(matrix_col_5),
+                id(matrix_col_6), id(matrix_col_7), id(matrix_col_8),
+                id(matrix_col_9), id(matrix_col_10), id(matrix_col_11)
+              };
+              static int16_t col_y[12] = { -260, -40, -180, -300, -10, -220,
+                                            -60, -260, -120, -20, -200, -100 };
+              static uint8_t tick = 0;
+              tick++;
+              for (int i = 0; i < 12; i++) {
+                col_y[i] += 6;
+                if (col_y[i] > 260) col_y[i] = -280;
+                lv_obj_set_y(cols[i], col_y[i]);
+                if (((tick + i) % 14) == 0) {
+                  std::string s;
+                  for (int r = 0; r < 16; r++) {
+                    s += std::to_string(random_uint32() % 10);
+                    if (r != 15) s += "\n";
+                  }
+                  lv_label_set_text(cols[i], s.c_str());
+                }
+              }
+
+  # Re-checks the Available From/Until window every 30s so the home page
+  # banner flips over on its own as the clock crosses the threshold,
+  # even with nobody touching the screen or HA.
+  - interval: 30s
+    then:
+      - script.execute: apply_availability_status
+
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true
+
+i2c:
+  - id: bus_a
+    sda: GPIO08
+    scl: GPIO18
+    scan: true
+    frequency: 100kHz
+  - id: bus_b
+    sda: GPIO41
+    scl: GPIO40
+    scan: true
+    frequency: 100kHz
+
+output:
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+light:
+  # LCD backlight - controlled from the Settings > "LCD Brightness" page.
+  # ESPHome auto-exposes this to HA as ${lcd_backlight_entity}.
+  - platform: monochromatic
+    id: led
+    name: "LCD Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+number:
+  #── Live size/opacity controls for the availability banner, editable from
+  #   Home Assistant under this device's entities. BOTTOM_MID align on the
+  #   banner itself means growing height extends the top edge upward
+  #   (bottom edge stays put), and width is a percentage of screen width.
+  #   Background color itself stays automatic (green when available, red
+  #   after-hours - see apply_availability_status); opacity just controls
+  #   how solid vs. see-through that color reads. Max raised to 290px -
+  #   enough to let the banner ride up past the "DOOR BELL" text, the bell
+  #   glyph, AND the down-arrow underneath it (arrow sits at y: 40, ~24px
+  #   tall, so its top edge is ~y=40), stopping just clear of the arrow at
+  #   ~y=32. This is deliberately higher than the old "stop under the
+  #   header row" behavior: the round PRESS HERE button (doorbell_icon_btn)
+  #   is centered with a y: -16 offset and 150px height/width, so its own
+  #   top edge sits at roughly (screen_h/2 - 16 - 75) - only a few px below
+  #   the arrow. Stopping the banner right at the arrow (old ~64px offset)
+  #   left the button's curved top peeking out above the banner's flat top
+  #   edge, tappable in a thin sliver near center; clearing the arrow
+  #   entirely now covers that curve too. The on_value lambda below clamps
+  #   against the *actual* live display height (via lv_disp_get_ver_res)
+  #   rather than a hardcoded 240, so this works the same in landscape and
+  #   portrait. The settings/lock button and the "return to call" badge
+  #   are declared after this banner in home_page's widget list, so both
+  #   stay drawn on top of it and stay tappable no matter how tall the
+  #   banner gets.
+  - platform: template
+    name: "Banner Height"
+    id: banner_height_num
+    icon: "mdi:arrow-expand-vertical"
+    unit_of_measurement: "px"
+    min_value: 20
+    max_value: 290
+    step: 1
+    initial_value: 70
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          // Bottom edge is pinned via BOTTOM_MID align, y: -6 (see the
+          // availability_banner widget) - 6px up from the true bottom.
+          // Clamp the top edge so it can ride up past the down-arrow
+          // (~y=40, so stop just clear of it at ~y=32) but no further,
+          // on whichever canvas height is actually active right now.
+          int requested = (int) x;
+          lv_coord_t disp_h = lv_disp_get_ver_res(NULL);
+          int max_reachable = (int) disp_h - 6 - 32;
+          int h = requested > max_reachable ? max_reachable : requested;
+          lv_obj_set_height(id(availability_banner), h);
+  - platform: template
+    name: "Banner Width"
+    id: banner_width_num
+    icon: "mdi:arrow-expand-horizontal"
+    unit_of_measurement: "%"
+    min_value: 50
+    max_value: 100
+    step: 1
+    initial_value: 92
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          lv_obj_set_width(id(availability_banner), lv_pct((int) x));
+  - platform: template
+    name: "Banner Background Opacity"
+    id: banner_bg_opacity_num
+    icon: "mdi:opacity"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 92
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          lv_obj_set_style_bg_opa(id(availability_banner), (lv_opa_t) ((x / 100.0) * 255), 0);
+
+sensor:
+  - platform: adc
+    pin: GPIO10
+    id: battery_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: "voltage"
+    entity_category: "diagnostic"
+    update_interval: 30s
+    attenuation: auto
+    filters:
+      - multiply: 4.11
+  - platform: copy
+    id: battery_percent
+    source_id: battery_voltage
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: "battery"
+    entity_category: "diagnostic"
+    filters:
+      - lambda: return (x - 2.7) / (4.2 - 2.7) * 100;
+      - clamp:
+          min_value: 0
+          max_value: 100
+
+i2s_audio:
+  - id: mic_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO17
+      allow_other_uses: true
+    i2s_mclk_pin:
+      number: GPIO2
+      allow_other_uses: true
+  - id: speaker_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO17
+      allow_other_uses: true
+    i2s_mclk_pin:
+      number: GPIO2
+      allow_other_uses: true
+
+audio_adc:
+  platform: es7210
+  id: es7210_adc
+  i2c_id: bus_a
+  bits_per_sample: 16bit
+  sample_rate: 16000
+
+audio_dac:
+  platform: es8311
+  id: es8311_dac
+  i2c_id: bus_a
+  bits_per_sample: 16bit
+  sample_rate: 16000
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    i2s_audio_id: mic_bus
+    i2s_mode: secondary  # mic slaves to the speaker's clock instead of being the master
+    sample_rate: 16000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    channel: right
+    adc_type: external
+
+speaker:
+  - id: i2s_audio_speaker
+    platform: i2s_audio
+    i2s_audio_id: speaker_bus
+    i2s_mode: primary  # speaker is now the I2S clock master, drives BCLK/LRCLK/MCLK continuously
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+    audio_dac: es8311_dac
+    buffer_duration: 100ms
+  - platform: resampler
+    id: voip_speaker
+    output_speaker: i2s_audio_speaker
+    sample_rate: 16000
+
+rtttl:
+  - id: ringtone
+    speaker: i2s_audio_speaker
+    gain: 0.6
+    on_finished_playback:
+      - logger.log: "rtttl: finished playback callback fired"
+      - delay: 800ms
+      - if:
+          condition:
+            lambda: 'return id(current_page) == "incall" && !id(call_active);'
+          then:
+            - logger.log: "rtttl: still ringing, replaying"
+            - rtttl.play:
+                id: ringtone
+                rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+
+button:
+  - platform: template
+    name: "Test Ringtone"
+    entity_category: diagnostic
+    on_press:
+      - logger.log: "rtttl: manual test triggered"
+      - rtttl.play:
+          id: ringtone
+          rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+
+script:
+  # ------------------------------------------------------------------
+  # Applies a screen rotation (0/90/180/270) at runtime: rotates the
+  # LVGL framebuffer + touch input, persists the choice, and reflows
+  # per-page layouts that don't already scale via alignment/percentages.
+  # ------------------------------------------------------------------
+  - id: apply_screen_rotation
+    parameters:
+      rotation: int
+    then:
+      - globals.set:
+          id: screen_rotation_deg
+          value: !lambda 'return rotation;'
+      - lvgl.display.set_rotation:
+          rotation: !lambda 'return rotation;'
+      - script.execute: apply_dialpad_layout
+      - script.execute: apply_pinpad_layout
+      - script.execute: apply_settings_layout
+      - script.execute: apply_incall_layout
+      - script.execute: apply_audio_mic_layout
+      - script.execute: apply_lcd_brightness_layout
+  # ------------------------------------------------------------------
+  # Dial pad grid re-layout. Landscape (0/180) uses the original
+  # 320-wide 3-column grid; portrait (90/270) uses a narrower grid that
+  # takes advantage of the extra vertical room on a 240x320 canvas.
+  # Only the outer button boxes need repositioning - the labels inside
+  # each button are aligned relative to it (LEFT_MID/RIGHT_MID/CENTER),
+  # so they follow automatically.
+  # ------------------------------------------------------------------
+  - id: apply_dialpad_layout
+    then:
+      - lambda: |-
+          bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);
+
+          int col_x_land[3]  = {10, 112, 214};
+          int col_x_port[3]  = {8, 85, 162};
+          int col_w_land = 96, col_w_port = 69;
+          int row_h_land = 36, row_h_port = 40;
+          int row_y_land[4] = {28, 68, 108, 148};
+          int row_y_port[4] = {40, 86, 132, 178};
+          int bottom_y_land = 192, bottom_h_land = 40;
+          int bottom_y_port = 222, bottom_h_port = 48;
+
+          int *col_x = portrait ? col_x_port : col_x_land;
+          int col_w = portrait ? col_w_port : col_w_land;
+          int row_h = portrait ? row_h_port : row_h_land;
+          int *row_y = portrait ? row_y_port : row_y_land;
+          int bottom_y = portrait ? bottom_y_port : bottom_y_land;
+          int bottom_h = portrait ? bottom_h_port : bottom_h_land;
+
+          lv_obj_t *grid[12] = {
+            id(dial_btn_1), id(dial_btn_2), id(dial_btn_3),
+            id(dial_btn_4), id(dial_btn_5), id(dial_btn_6),
+            id(dial_btn_7), id(dial_btn_8), id(dial_btn_9),
+            id(dial_btn_star), id(dial_btn_0), id(dial_btn_hash),
+          };
+          for (int i = 0; i < 12; i++) {
+            int row = i / 3, col = i % 3;
+            lv_obj_set_pos(grid[i], col_x[col], row_y[row]);
+            lv_obj_set_size(grid[i], col_w, row_h);
+          }
+
+          lv_obj_set_pos(id(dialpad_call_btn), col_x[0], bottom_y);
+          lv_obj_set_size(id(dialpad_call_btn), col_w, bottom_h);
+          lv_obj_set_pos(id(dialpad_end_btn), col_x[1], bottom_y);
+          lv_obj_set_size(id(dialpad_end_btn), col_w, bottom_h);
+          lv_obj_set_pos(id(dialpad_homepage_btn), col_x[2], bottom_y);
+          lv_obj_set_size(id(dialpad_homepage_btn), col_w, bottom_h);
+  # ------------------------------------------------------------------
+  # Settings PIN keypad re-layout. Same landscape/portrait grid logic
+  # as the dial pad above, applied to the PIN entry page's 3x4 keypad.
+  # ------------------------------------------------------------------
+  - id: apply_pinpad_layout
+    then:
+      - lambda: |-
+          bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);
+
+          int col_x_land[3]  = {10, 112, 214};
+          int col_x_port[3]  = {8, 85, 162};
+          int col_w_land = 96, col_w_port = 69;
+          int row_h_land = 36, row_h_port = 40;
+          int row_y_land[4] = {50, 90, 130, 170};
+          int row_y_port[4] = {66, 112, 158, 204};
+
+          int *col_x = portrait ? col_x_port : col_x_land;
+          int col_w = portrait ? col_w_port : col_w_land;
+          int row_h = portrait ? row_h_port : row_h_land;
+          int *row_y = portrait ? row_y_port : row_y_land;
+
+          lv_obj_t *grid[12] = {
+            id(settings_pin_1), id(settings_pin_2), id(settings_pin_3),
+            id(settings_pin_4), id(settings_pin_5), id(settings_pin_6),
+            id(settings_pin_7), id(settings_pin_8), id(settings_pin_9),
+            id(settings_pin_clear), id(settings_pin_0), id(settings_pin_enter),
+          };
+          for (int i = 0; i < 12; i++) {
+            int row = i / 3, col = i % 3;
+            lv_obj_set_pos(grid[i], col_x[col], row_y[row]);
+            lv_obj_set_size(grid[i], col_w, row_h);
+          }
+  # ------------------------------------------------------------------
+  # Settings menu re-layout. The five stacked full-width rows are
+  # sized for the 320-wide landscape canvas; narrow them to fit the
+  # 240-wide portrait canvas with a 10px margin on each side.
+  # ------------------------------------------------------------------
+  - id: apply_settings_layout
+    then:
+      - lambda: |-
+          bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);
+          int w = portrait ? 220 : 300;
+
+          lv_obj_t *rows[5] = {
+            id(settings_unlock_door_btn), id(settings_dialpad_btn),
+            id(settings_audio_mic_btn), id(settings_lcd_brightness_btn),
+            id(settings_homepage_exit_btn),
+          };
+          for (int i = 0; i < 5; i++) {
+            lv_obj_set_width(rows[i], w);
+          }
+  # ------------------------------------------------------------------
+  # In-call page re-layout. The volume/mic +/- rows sit out at
+  # x=254-288 on the 320-wide landscape canvas, which runs off the
+  # edge of the 240-wide portrait canvas, so pull them in. The
+  # full-width answer/hangup bar is resized and re-pinned to the
+  # bottom of whichever canvas is active, and the timer/status labels
+  # are spread out a bit more to use the taller portrait canvas.
+  # ------------------------------------------------------------------
+  - id: apply_incall_layout
+    then:
+      - lambda: |-
+          bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);
+
+          int minus_x = portrait ? 120 : 165;
+          int label_x = portrait ? 161 : 206;
+          int plus_x  = portrait ? 196 : 254;
+          int screen_w = portrait ? 240 : 320;
+          int screen_h = portrait ? 320 : 240;
+
+          lv_obj_set_x(id(incall_speaker_down_btn), minus_x);
+          lv_obj_set_x(id(incall_speaker_vol_label), label_x);
+          lv_obj_set_x(id(incall_speaker_up_btn), plus_x);
+          lv_obj_set_x(id(incall_mic_down_btn), minus_x);
+          lv_obj_set_x(id(incall_mic_gain_label), label_x);
+          lv_obj_set_x(id(incall_mic_up_btn), plus_x);
+
+          lv_obj_set_y(id(call_timer_label), portrait ? 130 : 92);
+          lv_obj_set_y(id(incall_status_label), portrait ? 190 : 150);
+
+          lv_obj_set_size(id(answer_btn), screen_w, 44);
+          lv_obj_set_pos(id(answer_btn), 0, screen_h - 44);
+  # ------------------------------------------------------------------
+  # Audio/Mic control page re-layout. The switches and +/- buttons sit
+  # near the right edge of the 320-wide landscape canvas (x up to
+  # 306); pull them in on the 240-wide portrait canvas so nothing
+  # clips off the edge.
+  # ------------------------------------------------------------------
+  - id: apply_audio_mic_layout
+    then:
+      - lambda: |-
+          bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);
+          int switch_x = portrait ? 170 : 250;
+          int plus_x   = portrait ? 176 : 256;
+
+          lv_obj_set_x(id(auto_answer_switch), switch_x);
+          lv_obj_set_x(id(mute_switch), switch_x);
+          lv_obj_set_x(id(volume_up_btn), plus_x);
+          lv_obj_set_x(id(mic_gain_up_btn), plus_x);
+  # ------------------------------------------------------------------
+  # LCD brightness page re-layout. The slider is sized for the
+  # 320-wide landscape canvas; narrow it for the 240-wide portrait
+  # canvas. The back button's y-offset (measured from screen center)
+  # was set for the taller portrait canvas and actually ran off the
+  # bottom of the shorter 240px-tall landscape canvas, so give each
+  # orientation its own value.
+  # ------------------------------------------------------------------
+  - id: apply_lcd_brightness_layout
+    then:
+      - lambda: |-
+          bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);
+
+          lv_obj_set_width(id(lcd_brightness_slider), portrait ? 220 : 300);
+          lv_obj_set_y(id(back_from_lcd_brightness_btn), portrait ? 150 : 80);
+  # ------------------------------------------------------------------
+  # Redraws the home page for the current HA connection state:
+  #   - Connected: overlay hidden, doorbell icon pulses red (handled by
+  #     the 700ms interval above).
+  #   - Disconnected: full-screen red "DOOR BELL UNAVAILABLE" overlay.
+  # ------------------------------------------------------------------
+  - id: apply_home_status
+    then:
+      - lambda: |-
+          if (id(ha_connected)) {
+            lv_obj_add_flag(id(doorbell_unavailable_overlay), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_clear_flag(id(doorbell_unavailable_overlay), LV_OBJ_FLAG_HIDDEN);
+          }
+  # ------------------------------------------------------------------
+  # Shows/hides the full-screen "stolen" overlay based on live Wi-Fi
+  # link state. This overlay sits above (is defined after, in the home
+  # page widget list, so it draws on top of) the "DOOR BELL UNAVAILABLE"
+  # HA-disconnect overlay, so if Wi-Fi itself is down it takes over the
+  # whole screen instead of showing the HA message. It clears the
+  # moment Wi-Fi reconnects, letting the HA overlay (or the normal home
+  # page) show through again.
+  # ------------------------------------------------------------------
+  - id: apply_wifi_status
+    then:
+      - lambda: |-
+          if (id(wifi_connected)) {
+            lv_obj_add_flag(id(stolen_overlay), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_clear_flag(id(stolen_overlay), LV_OBJ_FLAG_HIDDEN);
+          }
+  # ------------------------------------------------------------------
+  # Swaps the settings-button glyph between locked/unlocked and recolors
+  # both the glyph and its circular button background to match, based on
+  # binary_sensor.door_alarm_door. To a passerby it just looks like a
+  # door-lock status indicator. What tapping it does depends on that
+  # same status - see lock_icon_single_tap_action below and the
+  # settings_btn on_click for the full single/double-tap logic.
+  #   - locked/closed  -> solid green icon, lime circle (translucent)
+  #   - unlocked/open  -> solid red icon, orange circle (translucent)
+  # bg_opa is kept low (~35%) so the circle reads as a soft tinted glow
+  # behind the icon rather than a flat, fully opaque color swatch.
+  # ------------------------------------------------------------------
+  - id: apply_door_lock_icon
+    then:
+      - lambda: |-
+          if (id(door_alarm_door).state) {
+            // door reported open/unlocked -> red open-lock icon on a
+            // translucent orange circle
+            lv_label_set_text(id(settings_icon_label), "\xEE\xA2\x98"); // U+E898 lock_open
+            lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0xE74C3C), 0);
+            lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xFFA500), 0);
+            lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 90, 0);
+          } else {
+            // door reported closed/locked -> green closed-lock icon on a
+            // translucent lime circle
+            lv_label_set_text(id(settings_icon_label), "\xEE\xA2\x97"); // U+E897 lock
+            lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0x2ECC71), 0);
+            lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xBFFF00), 0);
+            lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 90, 0);
+          }
+  # ------------------------------------------------------------------
+  # Fires 350ms after a SINGLE tap on the lock icon - long enough for a
+  # second tap to arrive and cancel this via `script.stop` in
+  # settings_btn's on_click (making it a double tap instead). What it
+  # does depends on the door's current lock state:
+  #   - locked/closed (green)   -> opens the settings PIN pad, same as
+  #                                 the icon always used to do.
+  #   - unlocked/open (red)     -> toggles the door lock script directly,
+  #                                 no PIN needed, since a single tap on
+  #                                 an already-unlocked door reads as
+  #                                 "lock it back up".
+  # mode: restart means if this were ever triggered twice in a row
+  # without a cancel in between, the timer simply restarts rather than
+  # stacking - the stop/execute pairing below is the real double-tap
+  # guard, this is just a safety net.
+  # ------------------------------------------------------------------
+  - id: lock_icon_single_tap_action
+    mode: restart
+    then:
+      - delay: 350ms
+      - lambda: |-
+          ESP_LOGI("lock_icon", "single-tap resolved: door_alarm_door.state=%s -> %s",
+                   id(door_alarm_door).state ? "true (open/unlocked)" : "false (closed/locked)",
+                   id(door_alarm_door).state ? "TOGGLING LOCK" : "OPENING PIN PAD");
+      - if:
+          condition:
+            lambda: 'return id(door_alarm_door).state;'
+          then:
+            - if:
+                condition:
+                  api.connected: {}
+                then:
+                  - homeassistant.service:
+                      service: script.turn_on
+                      data:
+                        entity_id: ${door_lock_script_entity}
+                      on_error:
+                        - logger.log:
+                            format: "HA service error (script.turn_on door lock via single-tap): %s"
+                            args: ["error.c_str()"]
+                            tag: ha_service
+                else:
+                  - logger.log:
+                      format: "Skipped HA service call: no API connection"
+                      tag: ha_service
+          else:
+            - globals.set:
+                id: pin_buffer
+                value: '""'
+            - globals.set:
+                id: current_page
+                value: '"settings_pin"'
+            - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
+            - lvgl.page.show: settings_pin_page
+  # ------------------------------------------------------------------
+  # Colors the "DIAL PAD MAKE CALLS" row on the Settings page green
+  # when registered with the VoIP/FreePBX server, red otherwise.
+  # ------------------------------------------------------------------
+  - id: apply_dialpad_status
+    then:
+      - lambda: |-
+          uint32_t c = (id(wifi_connected) && id(sip_registered)) ? 0x2ECC71 : 0xE74C3C;
+          lv_obj_set_style_text_color(id(settings_dialpad_label), lv_color_hex(c), 0);
+  # ------------------------------------------------------------------
+  # Doorbell press - fired by tapping anywhere on the home page, the big
+  # doorbell icon itself, or the physical Home button while already on
+  # the home page. Rings ${doorbell_extension} over SIP.
+  # ------------------------------------------------------------------
+  - id: doorbell_press
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ha_connected) && id(wifi_connected) && !id(call_in_progress) && !id(dnd_enabled);'
+          then:
+            - lambda: |-
+                // brief white flash for tactile confirmation the press registered
+                // (the 700ms pulse interval takes back over on its next tick)
+                lv_obj_set_style_bg_color(id(doorbell_icon_btn), lv_color_hex(0xFFFFFF), 0);
+            - globals.set:
+                id: call_is_outgoing
+                value: 'true'
+            - globals.set:
+                id: call_in_progress
+                value: 'true'
+            - globals.set:
+                id: call_seconds
+                value: '0'
+            - lambda: |-
+                lv_label_set_text(id(incall_status_label), "RINGING RESIDENCE...");
+                lv_label_set_text(id(call_timer_label), "00:00");
+                lv_label_set_text(id(answer_btn_label), "CANCEL");
+                lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                char buf[12];
+                snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                lv_label_set_text(id(incall_mic_gain_label), buf);
+            - globals.set:
+                id: current_page
+                value: '"incall"'
+            - lvgl.page.show: incall_page
+            - sip_client.call:
+                id: phone
+                number: "${doorbell_extension}"
+          else:
+            - logger.log: "Doorbell press ignored: not connected, a call is already in progress, or Do Not Disturb is on"
+  # ------------------------------------------------------------------
+  # After-hours availability banner. Compares the current time against
+  # the "Available From"/"Available Until" times (both editable from HA,
+  # under this device's entities) and shows whichever custom message
+  # (also HA-editable) is currently active on the home page, recoloring
+  # the banner to match. Handles a window that wraps past midnight
+  # (e.g. From 20:00 Until 06:00) as well as a normal same-day window.
+  #
+  # Also auto-drives Do Not Disturb + the banner height number off the
+  # same From/Until schedule, right at the moment the clock crosses
+  # each threshold (edge-detected via schedule_was_available so this
+  # only fires once per crossing, not every 30s):
+  #   - Available From hits  -> DND turns OFF  (PRESS HERE re-shown),
+  #                              banner height -> 35px
+  #   - Available Until hits -> DND turns ON,
+  #                              banner height -> 290px (covers the
+  #                              button fully - see banner_height_num)
+  # Manually toggling DND or the banner height mid-window (e.g. from
+  # HA) is left alone until the next scheduled crossing.
+  # ------------------------------------------------------------------
+  - id: apply_availability_status
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (!now.is_valid()) return;
+          int now_min = now.hour * 60 + now.minute;
+          int from_min = id(available_from).hour * 60 + id(available_from).minute;
+          int until_min = id(available_until).hour * 60 + id(available_until).minute;
+
+          bool available;
+          if (from_min <= until_min) {
+            available = (now_min >= from_min && now_min < until_min);
+          } else {
+            // Window wraps past midnight.
+            available = (now_min >= from_min || now_min < until_min);
+          }
+
+          std::string msg = available ? id(available_message).state : id(unavailable_message).state;
+          uint32_t bg     = available ? 0x123D22 : 0x3D1414;
+          uint32_t border = available ? 0x2ECC71 : 0xE74C3C;
+
+          lv_label_set_text(id(availability_banner_label), msg.c_str());
+          lv_obj_set_style_bg_color(id(availability_banner), lv_color_hex(bg), 0);
+          lv_obj_set_style_border_color(id(availability_banner), lv_color_hex(border), 0);
+
+          if (id(schedule_check_initialized)) {
+            if (available && !id(schedule_was_available)) {
+              // Just crossed Available From.
+              id(dnd_switch).turn_off();
+              id(banner_height_num).make_call().set_value(35).perform();
+            } else if (!available && id(schedule_was_available)) {
+              // Just crossed Available Until.
+              id(dnd_switch).turn_on();
+              id(banner_height_num).make_call().set_value(290).perform();
+            }
+          }
+          id(schedule_was_available) = available;
+          id(schedule_check_initialized) = true;
+
+sip_client:
+  id: phone
+  server: "192.168.8.220"
+  username: ${voip_test_account_extension}
+  password: ${voip_test_account_password}
+  microphone: box_mic
+  speaker: voip_speaker
+  channel: mono
+  on_registered:
+    - logger.log: "SIP: registered with server"
+    - globals.set:
+        id: sip_registered
+        value: 'true'
+    - script.execute: apply_dialpad_status
+  on_incoming_call:
+    - logger.log:
+        format: "Incoming call from %s"
+        args: ['caller.c_str()']
+    - globals.set:
+        id: current_page
+        value: '"incall"'
+    - globals.set:
+        id: call_seconds
+        value: '0'
+    - globals.set:
+        id: call_in_progress
+        value: 'true'
+    - globals.set:
+        id: call_is_outgoing
+        value: 'false'
+    - lambda: |-
+        lv_label_set_text(id(incall_status_label), "RINGING...");
+        lv_label_set_text(id(call_timer_label), "00:00");
+        lv_label_set_text(id(answer_btn_label), "ANSWER");
+        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0x2ECC71), 0);
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+        lv_label_set_text(id(incall_mic_gain_label), buf);
+    - lvgl.page.show: incall_page
+    - light.turn_on:
+        id: led
+        flash_length: 500ms
+    - if:
+        condition:
+          lambda: 'return id(auto_answer_enabled);'
+        then:
+          - sip_client.answer: phone
+        else:
+          - logger.log: "rtttl: playing ring for incoming call"
+          - rtttl.play:
+              id: ringtone
+              rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+  on_call_connected:
+    - rtttl.stop:
+        id: ringtone
+    - globals.set:
+        id: call_active
+        value: 'true'
+    - globals.set:
+        id: call_is_outgoing
+        value: 'false'
+    - lambda: |-
+        lv_label_set_text(id(incall_status_label), "CONNECTED");
+        lv_label_set_text(id(answer_btn_label), "END CALL");
+        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+  on_call_ended:
+    - rtttl.stop:
+        id: ringtone
+    - globals.set:
+        id: call_active
+        value: 'false'
+    - globals.set:
+        id: call_in_progress
+        value: 'false'
+    - globals.set:
+        id: call_is_outgoing
+        value: 'false'
+    - globals.set:
+        id: current_page
+        value: '"home"'
+    - globals.set:
+        id: call_seconds
+        value: '0'
+    - lambda: |-
+        id(dial_buffer) = "";
+        lv_label_set_text(id(call_timer_label), "00:00");
+        lv_label_set_text(id(answer_btn_label), "ANSWER");
+        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0x2ECC71), 0);
+        // Whatever mic level the caller landed on mid-call is now saved as
+        // the standing setting (mic_gain_db has restore_value: true, so it
+        // survives reboots) - just make sure the Settings page reflects it.
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+        lv_label_set_text(id(mic_gain_label), buf);
+    - script.execute: apply_home_status
+    - lvgl.page.show: home_page
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+      ignore_strapping_warning: true
+    id: side_top_button
+    on_multi_click:
+      - timing:
+          - ON for at most 1s
+        then:
+          if:
+            condition:
+              lambda: 'return id(call_active);'
+            then:
+              - sip_client.hangup: phone
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(current_page) != "home";'
+                  then:
+                    - globals.set:
+                        id: current_page
+                        value: '"home"'
+                    - lvgl.page.show: home_page
+      - timing:
+          - ON for at least 1s
+        then:
+          - sip_client.hangup: phone
+
+  #── Door lock status, mirrored from Home Assistant ───────────────────────
+  # Drives the lock/unlock icon that replaced the settings gear (see
+  # apply_door_lock_icon script + settings_btn widget). NOTE: this assumes
+  # the standard binary_sensor convention where ON = open/unlocked and
+  # OFF = closed/locked. If your `binary_sensor.door_alarm_door` reports
+  # the opposite, just flip the condition in apply_door_lock_icon below.
+  - platform: homeassistant
+    id: door_alarm_door
+    entity_id: binary_sensor.door_alarm_door
+    on_state:
+      then:
+        - script.execute: apply_door_lock_icon
+
+  #── Physical top mute switch (ESP32-S3-Box-3 hardware) ──────────────────
+  # The hardware switch physically mutes the mic input. We do NOT stop/start
+  # the microphone capture or speaker here. Restarting the mic capture on the
+  # S3-Box-3 kills the shared I2S clock (since the mic is primary), which
+  # causes the speaker (secondary) to lose DMA buffer alignment and permanently
+  # desync until reboot. Letting the I2S bus run continuously prevents this.
+  - platform: gpio
+    pin:
+      number: GPIO1
+      mode: INPUT_PULLUP
+      inverted: true
+      # NOTE: ignore_strapping_warning removed because GPIO1 is NOT a strapping pin
+    id: hw_mute_switch
+    name: "Mic Mute Switch"
+    entity_category: diagnostic
+    on_state:
+      then:
+        - if:
+            condition:
+              binary_sensor.is_on: hw_mute_switch
+            then:
+              - logger.log: "Hardware mute engaged"
+            else:
+              - logger.log: "Hardware mute released"
+
+  #── Capacitive Home button below the screen ──────────────────────────────
+  # - During a call: hangs up.
+  # - Anywhere but home: goes home.
+  # - Already on home: acts as a second doorbell-press trigger, in case a
+  #   touch on the main screen doesn't register.
+  - platform: gt911
+    name: "Home Button"
+    index: 0
+    on_press:
+      if:
+        condition:
+          lambda: 'return id(call_active) || id(call_is_outgoing);'
+        then:
+          - sip_client.hangup: phone
+        else:
+          - if:
+              condition:
+                lambda: 'return id(current_page) == "home";'
+              then:
+                - script.execute: doorbell_press
+              else:
+                - globals.set:
+                    id: current_page
+                    value: '"home"'
+                - lvgl.page.show: home_page
+
+spi:
+  - id: spi_bus
+    clk_pin: 7
+    mosi_pin: 6
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_large
+    size: 40
+  - file: "gfonts://Roboto"
+    id: font_medium
+    size: 22
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_clock
+    size: 48
+    glyphs: "0123456789:APM "
+  #── Bold variants used on the home page for readability ─────────────────
+  - file: "gfonts://Roboto@700"
+    id: font_clock_bold
+    size: 52
+    glyphs: "0123456789:APM "
+  - file: "gfonts://Roboto@700"
+    id: font_medium_bold
+    size: 24
+  - file: "gfonts://Roboto@700"
+    id: font_large_bold
+    size: 40
+  #── Lock / unlock icon used in place of the settings gear so a passerby ──
+  # sees "it's a lock indicator" rather than "there's a settings menu here".
+  # Same font holds both glyphs so a single label can just swap its text.
+  - file: "gfonts://Material+Symbols+Outlined"
+    id: font_icon_lock_state
+    size: 24
+    glyphs: ["\uE897", "\uE898"]   # e897 = lock (closed), e898 = lock_open
+
+globals:
+  - id: dial_buffer
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: auto_answer_enabled
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: current_page
+    type: std::string
+    restore_value: false
+    initial_value: '"home"'
+  - id: call_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True from the moment a call starts ringing until it ends - broader
+  # than call_active (which only flips on once answered). Used to decide
+  # whether the "return to call" icon should be showing on the home page.
+  - id: call_in_progress
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True only while we're the one dialing out and it hasn't connected yet.
+  # Lets the in-call page tell an outgoing "CALLING..." state apart from
+  # an incoming "RINGING..." state, so the big action button says CANCEL
+  # instead of ANSWER when you're the caller.
+  - id: call_is_outgoing
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pin_buffer
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  # Timestamp of the last tap on the lock icon, used to distinguish a
+  # single tap from a double tap (see lock_icon_single_tap_action / the
+  # settings_btn on_click below).
+  - id: lock_icon_last_tap_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: lock_icon_last_tap_is_double
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: boot_complete
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: boot_dot_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: volume_percent
+    type: int
+    restore_value: true
+    initial_value: '70'
+  # Mic gain in dB, applied to the ES7210 ADC. restore_value keeps whatever
+  # level a caller settled on across reboots, same pattern as volume_percent.
+  - id: mic_gain_db
+    type: float
+    restore_value: true
+    initial_value: '24.0'
+  # Seconds elapsed on the current call, driven by the 1s interval below.
+  # Reset when a call comes in, only counts up once the call is answered.
+  - id: call_seconds
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Drives the flash on/off state of the "return to call" icon on the
+  # home page - only relevant while a call is active and you've backed
+  # out to the home page.
+  - id: call_return_blink
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Tracks live Wi-Fi link state.
+  - id: wifi_connected
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True once the SIP client has registered with the server at least once
+  # this boot. NOTE: the sip_client component only fires on_registered a
+  # single time per boot (it never fires an "unregistered" event even if
+  # the registration later lapses), so this - combined with wifi_connected -
+  # is the closest thing to a live "connected" signal this component
+  # exposes.
+  - id: sip_registered
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True while the ESPHome API client (Home Assistant) is connected. Drives
+  # the doorbell icon color and the full-screen "unavailable" overlay.
+  - id: ha_connected
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Number of API clients currently connected (HA, `esphome logs`, the
+  # dashboard, etc. all share the same native API). ha_connected must only
+  # go false when this drops to zero - otherwise closing a logs session
+  # while HA is still connected incorrectly flips the "unavailable" overlay
+  # on.
+  - id: api_client_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Persisted screen rotation in degrees (0/90/180/270), set from the
+  # "Screen Rotation" select entity in Home Assistant. Survives reboots
+  # so the mount orientation sticks, and is re-applied at LVGL boot.
+  - id: screen_rotation_deg
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # Edge-detection for the Available From/Until schedule (see
+  # apply_availability_status). Tracks whether the last check considered
+  # us "available" so the DND switch + banner height auto-actions below
+  # only fire once, right when the clock crosses a threshold - not on
+  # every 30s re-check while already inside that state, which would
+  # otherwise stomp on a manual DND toggle made mid-window.
+  - id: schedule_was_available
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  # False until the very first apply_availability_status run completes,
+  # so boot doesn't fire a spurious DND/banner change just because the
+  # restored state happens to disagree with the current time-of-day.
+  - id: schedule_check_initialized
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True while "Do Not Disturb" is toggled on from Home Assistant. Hides
+  # the round "PRESS HERE" doorbell button on the home page and blocks
+  # doorbell_press from ringing ${doorbell_extension}, whether the tap
+  # came from that button or from the invisible full-screen tap area
+  # behind it.
+  - id: dnd_enabled
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+
+display:
+  - platform: mipi_spi
+    id: s3_box_lcd
+    model: S3BOX
+    data_rate: 40MHz
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    color_order: bgr
+    invert_colors: false
+
+touchscreen:
+  - platform: gt911
+    id: box_touch
+    i2c_id: bus_a
+    display: s3_box_lcd
+
+lvgl:
+  id: lv
+  displays:
+    - s3_box_lcd
+  touchscreens:
+    - box_touch
+  rotation: 0
+  on_boot:
+    then:
+      - script.execute:
+          id: apply_screen_rotation
+          rotation: !lambda 'return id(screen_rotation_deg);'
+  pages:
+    # ------------------------------------------------------------------
+    # BOOT PAGE - shown until Home Assistant actually connects, so the
+    # user isn't staring at a home screen that looks ready but silently
+    # can't talk to HA yet. Stays up and animating (not a static splash)
+    # until on_client_connected fires below.
+    # ------------------------------------------------------------------
+    - id: boot_page
+      bg_color: 0x000000
+      widgets:
+        - label:
+            text: "${friendly_name2}"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: -60
+        - arc:
+            id: boot_spinner_arc
+            align: CENTER
+            y: 10
+            width: 70
+            height: 70
+            min_value: 0
+            max_value: 100
+            value: 25
+            start_angle: 0
+            end_angle: 360
+            rotation: 0
+            adjustable: false
+            arc_width: 6
+            bg_opa: TRANSP
+            indicator:
+              arc_color: 0x3D7BFF
+              arc_width: 6
+              arc_rounded: true
+        - label:
+            id: boot_status_label
+            text: "BOOTING"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            align: CENTER
+            y: 62
+
+    # ------------------------------------------------------------------
+    # HOME PAGE — doorbell front screen (HomePage_Screen_1.png)
+    # The whole page is a giant "press to ring the doorbell" surface:
+    # a full-screen invisible button underneath everything, the big
+    # red glowing/pulsing bell icon on top of it (own on_click does the
+    # same thing), and non-clickable clock/date/caption labels that let
+    # touches pass straight through to the surface beneath them. The
+    # small gear button in the corner sits on top so it captures its
+    # own taps instead of triggering the doorbell.
+    # ------------------------------------------------------------------
+    - id: home_page
+      bg_color: 0x000000
+      widgets:
+        # Matrix-style falling-numbers background - 12 columns of random
+        # digits, animated by the "Green digital-rain" interval above.
+        # Non-clickable, so taps still fall through to the doorbell
+        # button beneath/around them.
+        - label:
+            id: matrix_col_0
+            text: "3\n7\n1\n9\n4\n0\n8\n2\n6\n5\n1\n7\n3\n9\n0\n6"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 2
+            y: -260
+        - label:
+            id: matrix_col_1
+            text: "8\n2\n5\n0\n7\n1\n4\n9\n3\n6\n2\n8\n5\n0\n1\n4"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 30
+            y: -40
+        - label:
+            id: matrix_col_2
+            text: "1\n6\n9\n3\n0\n5\n8\n2\n4\n7\n1\n6\n9\n3\n0\n5"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 58
+            y: -180
+        - label:
+            id: matrix_col_3
+            text: "4\n0\n7\n2\n9\n6\n1\n8\n5\n3\n4\n0\n7\n2\n9\n6"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 86
+            y: -300
+        - label:
+            id: matrix_col_4
+            text: "9\n5\n2\n8\n1\n4\n0\n6\n3\n7\n9\n5\n2\n8\n1\n4"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 114
+            y: -10
+        - label:
+            id: matrix_col_5
+            text: "0\n8\n4\n1\n6\n3\n9\n5\n2\n7\n0\n8\n4\n1\n6\n3"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 142
+            y: -220
+        - label:
+            id: matrix_col_6
+            text: "6\n1\n3\n9\n5\n0\n7\n4\n8\n2\n6\n1\n3\n9\n5\n0"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 170
+            y: -60
+        - label:
+            id: matrix_col_7
+            text: "2\n9\n6\n0\n3\n8\n5\n1\n7\n4\n2\n9\n6\n0\n3\n8"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 198
+            y: -260
+        - label:
+            id: matrix_col_8
+            text: "7\n4\n0\n5\n8\n2\n6\n9\n1\n3\n7\n4\n0\n5\n8\n2"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 226
+            y: -120
+        - label:
+            id: matrix_col_9
+            text: "5\n1\n8\n4\n0\n7\n2\n3\n9\n6\n5\n1\n8\n4\n0\n7"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 254
+            y: -20
+        - label:
+            id: matrix_col_10
+            text: "3\n0\n6\n2\n9\n4\n1\n7\n5\n8\n3\n0\n6\n2\n9\n4"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 282
+            y: -200
+        - label:
+            id: matrix_col_11
+            text: "8\n3\n1\n7\n2\n5\n0\n9\n4\n6\n8\n3\n1\n7\n2\n5"
+            text_font: font_small
+            text_color: 0x00CC55
+            x: 306
+            y: -100
+        - button:
+            id: doorbell_full_screen_btn
+            x: 0
+            y: 0
+            width: 100%
+            height: 100%
+            radius: 0
+            bg_opa: TRANSP
+            shadow_width: 0
+            border_width: 0
+            on_click:
+              - script.execute: doorbell_press
+        - button:
+            id: doorbell_icon_btn
+            align: CENTER
+            y: -16
+            width: 150
+            height: 150
+            radius: 75
+            bg_color: 0xE74C3C
+            shadow_width: 26
+            shadow_spread: 6
+            shadow_color: 0xE74C3C
+            shadow_opa: 51%
+            widgets:
+              # Bell icon back to its normal (unscaled) size and centered
+              # position - it's purely a dimmed background watermark again
+              # now that the text sitting on top of it is just two short
+              # words instead of the APT/unit caption.
+              - label:
+                  id: doorbell_icon_label
+                  text: "\uF0F3"
+                  align: CENTER
+                  text_font: montserrat_48
+                  text_color: 0x000000
+                  text_opa: 35%
+              # Static "PRESS / ENTER" caption, bold white, layered on top
+              # of the dimmed bell icon (this is where APT/666 used to be).
+              - label:
+                  id: doorbell_press_label
+                  text: "PRESS"
+                  align: CENTER
+                  y: -18
+                  text_font: font_medium_bold
+                  text_color: 0xFFFFFF
+              - label:
+                  id: doorbell_enter_label
+                  text: "HERE"
+                  align: CENTER
+                  y: 14
+                  text_font: font_medium_bold
+                  text_color: 0xFFFFFF
+            on_click:
+              - script.execute: doorbell_press
+        # Dark backing panel so the caption stays readable over the
+        # moving rain columns behind it. Pushed further down than before
+        # so it clears the bottom edge of the button instead of
+        # overlapping it.
+        - obj:
+            id: doorbell_caption_backing
+            align: CENTER
+            y: 82
+            width: 90%
+            height: 34
+            radius: 8
+            bg_color: 0x000000
+            bg_opa: 55%
+            border_width: 0
+        # "APT 666" caption - this is where "PRESS HERE" used to sit;
+        # it swapped places with the PRESS/ENTER text now shown on the
+        # button itself. Editable from HA (Devices & Services > this
+        # device > "Caption - Apt/Unit"); the text below is just the
+        # compiled-in default shown before HA connects/restores it.
+        - label:
+            id: doorbell_caption_label
+            text: "APT 666"
+            text_font: font_medium_bold
+            text_color: 0xFFFFFF
+            text_align: CENTER
+            align: CENTER
+            width: 94%
+            y: 86
+        # "DOOR BELL" label + down arrow - top-left corner, pointing
+        # attention down toward the press button/icon below.
+        - label:
+            id: doorbell_topleft_label
+            text: "DOOR BELL"
+            text_font: font_medium_bold
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 10
+            y: 8
+        # Small bell glyph tacked on right after the "DOOR BELL" text.
+        # font_medium_bold is a custom Roboto font with no icon glyphs, so
+        # this has to be its own label in a built-in montserrat font
+        # (which does carry the FontAwesome symbol set) rather than
+        # appended inline into the text above.
+        - label:
+            id: doorbell_topleft_bell_icon
+            text: "\uF0F3"
+            text_font: montserrat_24
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 145
+            y: 8
+        - label:
+            id: doorbell_topleft_arrow
+            text: "\uF078"
+            text_font: montserrat_24
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 145
+            y: 40
+        # Available/after-hours status banner - background, border, and
+        # text all update via apply_availability_status (see script:
+        # above), driven by the Available From/Until times and the two
+        # custom messages, all editable from Home Assistant. Percentage
+        # width + BOTTOM_MID align means it fits landscape or portrait
+        # on its own, with no per-rotation coordinates needed. Bottom
+        # edge sits near the screen bottom (like before); height is
+        # stretched to fill the space up toward the Caption box above
+        # it, leaving a small gap so the two don't touch.
+        - obj:
+            id: availability_banner
+            align: BOTTOM_MID
+            y: -6
+            width: 92%
+            height: 70
+            radius: 8
+            bg_color: 0x123D22
+            bg_opa: 92%
+            border_width: 2
+            border_color: 0x2ECC71
+            widgets:
+              - label:
+                  id: availability_banner_label
+                  text: "We're here — ring the bell!"
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+                  text_align: CENTER
+                  align: CENTER
+                  width: 92%
+        - button:
+            id: settings_btn
+            align: TOP_RIGHT
+            x: -8
+            y: 8
+            width: 44
+            height: 44
+            radius: 22
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              # Looks like a plain door-lock status icon to anyone glancing
+              # at it. Its glyph/color are driven by apply_door_lock_icon
+              # (see script:), based on binary_sensor.door_alarm_door - it
+              # starts as a neutral gray closed-lock until the first state
+              # arrives from Home Assistant after boot.
+              - label:
+                  id: settings_icon_label
+                  text: "\uE897"
+                  align: CENTER
+                  text_font: font_icon_lock_state
+                  text_color: 0xB7C0CC
+            # Tap behavior now depends on tap count AND door lock status:
+            #   - Double tap (2nd tap within 350ms) -> ALWAYS opens the
+            #     settings PIN pad, no matter what the door status is.
+            #   - Single tap while locked/closed (green) -> also opens the
+            #     settings PIN pad (same as the icon always used to do).
+            #   - Single tap while unlocked/open (red) -> toggles the door
+            #     lock script directly, no PIN pad involved.
+            # The single-tap outcome is decided inside
+            # lock_icon_single_tap_action, which fires after a short delay
+            # so a following second tap has a chance to cancel it and
+            # promote the interaction to a double tap instead.
+            on_click:
+              - lambda: |-
+                  uint32_t now = millis();
+                  id(lock_icon_last_tap_is_double) = (now - id(lock_icon_last_tap_ms) < 350);
+                  id(lock_icon_last_tap_ms) = now;
+                  ESP_LOGI("lock_icon", "tap: double=%s door_alarm_door.state=%s",
+                           id(lock_icon_last_tap_is_double) ? "true" : "false",
+                           id(door_alarm_door).state ? "true (open/unlocked)" : "false (closed/locked)");
+              - if:
+                  condition:
+                    lambda: 'return id(lock_icon_last_tap_is_double);'
+                  then:
+                    - script.stop: lock_icon_single_tap_action
+                    - globals.set:
+                        id: lock_icon_last_tap_ms
+                        value: '0'
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - globals.set:
+                        id: current_page
+                        value: '"settings_pin"'
+                    - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
+                    - lvgl.page.show: settings_pin_page
+                  else:
+                    - script.execute: lock_icon_single_tap_action
+        # Flashing "return to call" badge - hidden unless a call is in
+        # progress. Sits above the settings gear so it's always reachable.
+        - button:
+            id: call_return_btn
+            align: TOP_RIGHT
+            x: -8
+            y: 60
+            width: 44
+            height: 44
+            radius: 22
+            bg_color: 0xFFC107
+            border_width: 0
+            shadow_width: 20
+            shadow_spread: 4
+            shadow_ofs_x: 0
+            shadow_ofs_y: 0
+            shadow_color: 0xFFD65C
+            shadow_opa: COVER
+            hidden: true
+            widgets:
+              - label:
+                  text: "\uF095"
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0x241700
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"incall"'
+              - lvgl.page.show: incall_page
+        # Full-screen "unavailable" overlay - hidden while HA is connected,
+        # shown (and blinked by the interval above) whenever it drops.
+        - obj:
+            id: doorbell_unavailable_overlay
+            x: 0
+            y: 0
+            width: 100%
+            height: 100%
+            radius: 0
+            bg_color: 0x000000
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 20
+            hidden: true
+            widgets:
+              - label:
+                  id: doorbell_unavailable_label
+                  text: "DOOR BELL\nUNAVAILABLE\nAT THIS TIME"
+                  text_font: font_medium_bold
+                  text_color: 0xE74C3C
+                  text_align: CENTER
+                  align: CENTER
+        # Full-screen "stolen" takeover - hidden while Wi-Fi is up, shown
+        # (and kept on top of the HA-unavailable overlay above, since it's
+        # declared after it here) the instant the link drops. White
+        # background, bold red text, word-wrapped and width-constrained so
+        # it fits the panel cleanly in every rotation (0/90/180/270)
+        # without any per-rotation coordinates needed.
+        - obj:
+            id: stolen_overlay
+            x: 0
+            y: 0
+            width: 100%
+            height: 100%
+            radius: 0
+            bg_color: 0xFFFFFF
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 16
+            hidden: true
+            widgets:
+              - label:
+                  id: stolen_overlay_label
+                  text: "HELP I BEEN STOLEN\nRETURN TO\nPO BOX 1357\nLINDSAY, CA 93247"
+                  text_font: font_medium_bold
+                  text_color: 0xFF0000
+                  text_align: CENTER
+                  align: CENTER
+                  width: 92%
+                  long_mode: WRAP
+
+    # ------------------------------------------------------------------
+    # SETTINGS PIN ENTRY PAGE (SETTINGS_PIN_PAD_SCREEN_2.png)
+    # ------------------------------------------------------------------
+    - id: settings_pin_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Enter Settings PIN"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            align: TOP_LEFT
+            x: 12
+            y: 10
+        - button:
+            id: settings_pin_cancel
+            align: TOP_RIGHT
+            x: -10
+            y: 6
+            width: 32
+            height: 30
+            radius: 8
+            bg_color: 0xE74C3C
+            widgets:
+              - label: { text: "X", align: CENTER, text_font: font_small, text_color: 0xFFFFFF }
+            on_click:
+              - globals.set:
+                  id: pin_buffer
+                  value: '""'
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+        - label:
+            id: settings_pin_display
+            text: ""
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 30
+        # Compact 3x4 keypad (1-9, CLEAR / 0 / ENTER) sized to fit the
+        # 320x240 screen with no overflow.
+        - button:
+            id: settings_pin_1
+            x: 10
+            y: 50
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "1", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "1";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_2
+            x: 112
+            y: 50
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "2", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "2";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_3
+            x: 214
+            y: 50
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "3", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "3";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_4
+            x: 10
+            y: 90
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "4", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "4";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_5
+            x: 112
+            y: 90
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "5", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "5";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_6
+            x: 214
+            y: 90
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "6", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "6";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_7
+            x: 10
+            y: 130
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "7", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "7";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_8
+            x: 112
+            y: 130
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "8", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "8";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_9
+            x: 214
+            y: 130
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "9", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "9";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_clear
+            x: 10
+            y: 170
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xF1C40F
+            widgets:
+              - label: { text: "CLEAR", align: CENTER, text_font: font_small, text_color: 0x11151C }
+            on_click:
+              - globals.set:
+                  id: pin_buffer
+                  value: '""'
+              - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
+        - button:
+            id: settings_pin_0
+            x: 112
+            y: 170
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xEDEDED
+            widgets:
+              - label: { text: "0", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "0";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_enter
+            x: 214
+            y: 170
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label: { text: "ENTER", align: CENTER, text_font: font_small, text_color: 0xFFFFFF }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(pin_buffer) == "${settings_pin}";'
+                  then:
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - globals.set:
+                        id: current_page
+                        value: '"settings"'
+                    - script.execute: apply_dialpad_status
+                    - lvgl.page.show: settings_page
+                  else:
+                    - if:
+                        condition:
+                          lambda: 'return id(pin_buffer) == "${door_pin}";'
+                        then:
+                          # door_pin operates entirely on its own - it never
+                          # opens the settings menu, it just toggles the door
+                          # lock script and drops straight back to the home
+                          # page, exactly like a real door-lock keypad would.
+                          - globals.set:
+                              id: pin_buffer
+                              value: '""'
+                          - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
+                          - if:
+                              condition:
+                                api.connected: {}
+                              then:
+                                - homeassistant.service:
+                                    service: script.turn_on
+                                    data:
+                                      entity_id: ${door_lock_script_entity}
+                                    on_error:
+                                      - logger.log:
+                                          format: "HA service error (script.turn_on door lock via door_pin): %s"
+                                          args: ["error.c_str()"]
+                                          tag: ha_service
+                              else:
+                                - logger.log:
+                                    format: "Skipped HA service call: no API connection"
+                                    tag: ha_service
+                          - globals.set:
+                              id: current_page
+                              value: '"home"'
+                          - lvgl.page.show: home_page
+                        else:
+                          - globals.set:
+                              id: pin_buffer
+                              value: '""'
+                          - lambda: 'lv_label_set_text(id(settings_pin_display), "Wrong PIN");'
+
+    # ------------------------------------------------------------------
+    # SETTINGS PAGE (SETTINGS_SCREEN_3.png)
+    # ------------------------------------------------------------------
+    - id: settings_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Settings"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 8
+        - button:
+            id: settings_unlock_door_btn
+            x: 10
+            y: 36
+            width: 300
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Unlock Door"
+                  text_font: font_medium
+                  text_color: 0x3D7BFF
+                  align: CENTER
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: script.turn_on
+                        data:
+                          entity_id: ${door_lock_script_entity}
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (script.turn_on door lock): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: settings_dialpad_btn
+            x: 10
+            y: 76
+            width: 300
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: settings_dialpad_label
+                  text: "Dial Pad / Make Calls"
+                  text_font: font_medium
+                  text_color: 0x2ECC71
+                  align: CENTER
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) = "";
+                  lv_label_set_text(id(dial_display), "");
+              - globals.set:
+                  id: current_page
+                  value: '"dialpad"'
+              - lvgl.page.show: dialpad_page
+        - button:
+            id: settings_audio_mic_btn
+            x: 10
+            y: 116
+            width: 300
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Audio / Mic Control"
+                  text_font: font_medium
+                  text_color: 0xB7C0CC
+                  align: CENTER
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"audio_mic"'
+              - lvgl.page.show: audio_mic_page
+        - button:
+            id: settings_lcd_brightness_btn
+            x: 10
+            y: 156
+            width: 300
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "LCD Brightness"
+                  text_font: font_medium
+                  text_color: 0xE67E22
+                  align: CENTER
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"lcd_brightness"'
+              - lvgl.page.show: lcd_brightness_page
+        - button:
+            id: settings_homepage_exit_btn
+            x: 10
+            y: 196
+            width: 300
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Homepage Exit"
+                  text_font: font_medium
+                  text_color: 0xE74C3C
+                  align: CENTER
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+
+    # ------------------------------------------------------------------
+    # DIAL PAD PAGE (DIALPAD_SCREEN_4.png) — the ONLY dial pad in the
+    # firmware; it fully replaces the previous keypad implementation.
+    # ------------------------------------------------------------------
+    - id: dialpad_page
+      bg_color: 0xE8ECF5
+      widgets:
+        - label:
+            id: dial_display
+            text: ""
+            text_font: font_medium
+            text_color: 0x11151C
+            align: TOP_MID
+            y: 2
+        # Compact 3x4 dial grid, sized and spaced to match the Settings
+        # PIN pad's look and to fit the 320x240 screen with no overflow.
+        - button:
+            id: dial_btn_1
+            x: 10
+            y: 28
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "1", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "1";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_2
+            x: 112
+            y: 28
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "2", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "ABC", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "2";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_3
+            x: 214
+            y: 28
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "3", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "DEF", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "3";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_4
+            x: 10
+            y: 68
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "4", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "GHI", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "4";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_5
+            x: 112
+            y: 68
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "5", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "JKL", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "5";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_6
+            x: 214
+            y: 68
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "6", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "MNO", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "6";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_7
+            x: 10
+            y: 108
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "7", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "PQRS", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "7";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_8
+            x: 112
+            y: 108
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "8", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "TUV", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "8";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_9
+            x: 214
+            y: 108
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "9", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "WXYZ", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "9";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_star
+            x: 10
+            y: 148
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "*", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "*";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_0
+            x: 112
+            y: 148
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "0", align: LEFT_MID, x: 20, text_font: font_medium, text_color: 0x11151C }
+              - label: { text: "+", align: RIGHT_MID, x: -14, text_font: font_small, text_color: 0x808080 }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "0";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_hash
+            x: 214
+            y: 148
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0xFFFFFF
+            shadow_width: 4
+            shadow_color: 0xB9C3D1
+            shadow_opa: 40%
+            widgets:
+              - label: { text: "#", align: CENTER, text_font: font_medium, text_color: 0x11151C }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "#";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        # Bottom action row - colored pill buttons with icons, same
+        # column layout as the grid above so it lines up cleanly.
+        - button:
+            id: dialpad_call_btn
+            x: 10
+            y: 192
+            width: 96
+            height: 40
+            radius: 20
+            bg_color: 0x2ECC71
+            shadow_width: 0
+            widgets:
+              - label: { text: "\uF095  CALL", align: CENTER, text_font: montserrat_18, text_color: 0xFFFFFF }
+            on_click:
+              - if:
+                  # Only place the call if something's actually been
+                  # dialed - otherwise do nothing.
+                  condition:
+                    lambda: 'return !id(dial_buffer).empty();'
+                  then:
+                    - globals.set:
+                        id: call_is_outgoing
+                        value: 'true'
+                    - globals.set:
+                        id: call_in_progress
+                        value: 'true'
+                    - globals.set:
+                        id: call_seconds
+                        value: '0'
+                    - lambda: |-
+                        lv_label_set_text(id(incall_status_label), "CALLING...");
+                        lv_label_set_text(id(call_timer_label), "00:00");
+                        lv_label_set_text(id(answer_btn_label), "CANCEL");
+                        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                        char buf[12];
+                        snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                        lv_label_set_text(id(incall_mic_gain_label), buf);
+                    - globals.set:
+                        id: current_page
+                        value: '"incall"'
+                    - lvgl.page.show: incall_page
+                    - sip_client.call:
+                        id: phone
+                        number: !lambda 'return id(dial_buffer);'
+        - button:
+            id: dialpad_end_btn
+            x: 112
+            y: 192
+            width: 96
+            height: 40
+            radius: 20
+            bg_color: 0xE74C3C
+            shadow_width: 0
+            widgets:
+              - label: { text: "\uF00D  END", align: CENTER, text_font: montserrat_18, text_color: 0xFFFFFF }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(call_active) || id(call_is_outgoing);'
+                  then:
+                    - sip_client.hangup: phone
+              - lambda: |-
+                  id(dial_buffer) = "";
+                  lv_label_set_text(id(dial_display), "");
+              - globals.set:
+                  id: current_page
+                  value: '"settings"'
+              - lvgl.page.show: settings_page
+        - button:
+            id: dialpad_homepage_btn
+            x: 214
+            y: 192
+            width: 96
+            height: 40
+            radius: 20
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label: { text: "\uF015  HOME", align: CENTER, text_font: montserrat_18, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) = "";
+                  lv_label_set_text(id(dial_display), "");
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+
+    # ------------------------------------------------------------------
+    # IN-CALL PAGE - shown for the doorbell's own outgoing ring, for
+    # dial-pad calls, and for any incoming call.
+    # ------------------------------------------------------------------
+    - id: incall_page
+      bg_color: 0x000000
+      widgets:
+        - label:
+            text: "VOLUME:"
+            text_font: font_medium_bold
+            text_color: 0xFFFFFF
+            x: 8
+            y: 14
+        - button:
+            id: incall_speaker_down_btn
+            x: 165
+            y: 6
+            width: 34
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "-", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: |-
+                  int v = id(volume_percent) - 5;
+                  if (v < 0) v = 0;
+                  id(volume_percent) = v;
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return id(volume_percent) / 100.0;'
+              - lambda: |-
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                  lv_label_set_text(id(incall_speaker_vol_label), buf);
+                  lv_label_set_text(id(volume_percent_label), buf);
+        - label:
+            id: incall_speaker_vol_label
+            text: "85%"
+            text_font: font_small
+            text_color: 0xFFFFFF
+            x: 206
+            y: 16
+        - button:
+            id: incall_speaker_up_btn
+            x: 254
+            y: 6
+            width: 34
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "+", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: |-
+                  int v = id(volume_percent) + 5;
+                  if (v > 100) v = 100;
+                  id(volume_percent) = v;
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return id(volume_percent) / 100.0;'
+              - lambda: |-
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                  lv_label_set_text(id(incall_speaker_vol_label), buf);
+                  lv_label_set_text(id(volume_percent_label), buf);
+        - label:
+            text: "MIC LEVEL:"
+            text_font: font_medium_bold
+            text_color: 0xFFFFFF
+            x: 8
+            y: 56
+        - button:
+            id: incall_mic_down_btn
+            x: 165
+            y: 48
+            width: 34
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "-", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) - 3.0;
+                  if (g < 0.0) g = 0.0;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+                  lv_label_set_text(id(mic_gain_label), buf);
+        - label:
+            id: incall_mic_gain_label
+            text: "24.0dB"
+            text_font: font_small
+            text_color: 0xFFFFFF
+            x: 206
+            y: 58
+        - button:
+            id: incall_mic_up_btn
+            x: 254
+            y: 48
+            width: 34
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "+", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) + 3.0;
+                  if (g > 37.5) g = 37.5;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+                  lv_label_set_text(id(mic_gain_label), buf);
+        - label:
+            id: call_timer_label
+            text: "00:00"
+            text_font: font_clock_bold
+            text_color: 0xFFC107
+            align: TOP_MID
+            y: 92
+        - label:
+            id: incall_status_label
+            text: "RINGING..."
+            text_font: font_medium_bold
+            text_color: 0xFFC107
+            align: TOP_MID
+            y: 150
+        - button:
+            id: answer_btn
+            x: 0
+            y: 196
+            width: 320
+            height: 44
+            radius: 0
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  id: answer_btn_label
+                  text: "ANSWER"
+                  align: CENTER
+                  text_font: font_medium_bold
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  # Once connected, or while we're the one dialing out
+                  # (call_is_outgoing - including the doorbell's own ring),
+                  # this button always hangs up/cancels. It only answers
+                  # when we're on the receiving end of a still-ringing
+                  # incoming call.
+                  condition:
+                    lambda: 'return id(call_active) || id(call_is_outgoing);'
+                  then:
+                    - sip_client.hangup: phone
+                  else:
+                    - sip_client.answer: phone
+
+    # ------------------------------------------------------------------
+    # AUDIO / MIC CONTROL PAGE — opened from Settings > "Audio/Mic Control"
+    # ------------------------------------------------------------------
+    - id: audio_mic_page
+      bg_color: 0x11151C
+      widgets:
+        # Back button lives right up top next to the title instead of
+        # trailing after all the controls, so it's always in easy reach.
+        - button:
+            id: back_from_audio_mic_btn
+            x: 8
+            y: 6
+            width: 32
+            height: 28
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "\uF053", align: CENTER, text_font: montserrat_18, text_color: 0xFFFFFF }
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"settings"'
+              - lvgl.page.show: settings_page
+        - label:
+            text: "Audio / Mic Control"
+            text_font: font_small
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 12
+        - label:
+            text: "Auto-Answer"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 14
+            y: 46
+        - switch:
+            id: auto_answer_switch
+            x: 250
+            y: 42
+            on_click:
+              - switch.toggle: voip_auto_answer
+        - label:
+            text: "Mute Speaker"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 14
+            y: 78
+        - switch:
+            id: mute_switch
+            x: 250
+            y: 74
+            on_click:
+              - switch.toggle: speaker_mute
+        - label:
+            text: "Volume"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 14
+            y: 110
+        - button:
+            id: volume_down_btn
+            x: 14
+            y: 128
+            width: 50
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "-", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  int v = id(volume_percent) - 5;
+                  if (v < 0) v = 0;
+                  id(volume_percent) = v;
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return id(volume_percent) / 100.0;'
+              - lambda: |-
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                  lv_label_set_text(id(volume_percent_label), buf);
+        - label:
+            id: volume_percent_label
+            text: "70%"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            x: 0
+            y: 132
+        - button:
+            id: volume_up_btn
+            x: 256
+            y: 128
+            width: 50
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "+", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  int v = id(volume_percent) + 5;
+                  if (v > 100) v = 100;
+                  id(volume_percent) = v;
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return id(volume_percent) / 100.0;'
+              - lambda: |-
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                  lv_label_set_text(id(volume_percent_label), buf);
+        - label:
+            text: "Mic Gain"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 14
+            y: 168
+        - button:
+            id: mic_gain_down_btn
+            x: 14
+            y: 186
+            width: 50
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "-", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) - 3.0;
+                  if (g < 0.0) g = 0.0;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(mic_gain_label), buf);
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+        - label:
+            id: mic_gain_label
+            text: "24.0dB"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            x: 0
+            y: 190
+        - button:
+            id: mic_gain_up_btn
+            x: 256
+            y: 186
+            width: 50
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "+", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) + 3.0;
+                  if (g > 37.5) g = 37.5;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(mic_gain_label), buf);
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+
+    # ------------------------------------------------------------------
+    # LCD BRIGHTNESS PAGE — opened from Settings > "LCD Brightness"
+    # ------------------------------------------------------------------
+    - id: lcd_brightness_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "LCD Brightness"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 10
+        - slider:
+            id: lcd_brightness_slider
+            x: 10
+            y: 100
+            width: 300
+            height: 16
+            min_value: 10
+            max_value: 100
+            value: 100
+            bg_color: 0x1F2632
+            indicator:
+              bg_color: 0xE67E22
+            knob:
+              bg_color: 0xFFFFFF
+            on_release:
+              - light.turn_on:
+                  id: led
+                  brightness: !lambda 'return x / 100.0;'
+        - button:
+            id: back_from_lcd_brightness_btn
+            align: CENTER
+            y: 150
+            width: 150
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "Back", align: CENTER, text_font: font_small, text_color: 0xFFFFFF }
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"settings"'
+              - lvgl.page.show: settings_page
+
+text:
+  #── "APT 666" caption box under the doorbell button, editable from Home
+  #   Assistant under this device's entities (Devices & Services > this
+  #   device). Updates the home page label live (on_value below) and is
+  #   re-applied on boot once HA reconnects (see api > on_client_connected).
+  - platform: template
+    name: "Caption - Apt/Unit"
+    id: door_caption_message
+    icon: "mdi:card-text-outline"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "APT 666"
+    max_length: 20
+    on_value:
+      - lambda: |-
+          lv_label_set_text(id(doorbell_caption_label), id(door_caption_message).state.c_str());
+  #── Custom availability messages, editable from Home Assistant under
+  #   this device's entities (Devices & Services > this device). Whichever
+  #   one is active - based on the Available From/Until times below - is
+  #   shown on the home page banner, which also recolors to match.
+  - platform: template
+    name: "Message - Available"
+    id: available_message
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "We're here — ring the bell!"
+    max_length: 40
+    on_value:
+      - script.execute: apply_availability_status
+  - platform: template
+    name: "Message - After Hours"
+    id: unavailable_message
+    icon: "mdi:message-text-outline"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "We're away right now. Please leave a message."
+    max_length: 60
+    on_value:
+      - script.execute: apply_availability_status
+
+datetime:
+  #── "Available" window - outside these hours the home page banner
+  #   switches to the after-hours message/colors above. Both editable
+  #   from HA; a window that wraps past midnight is handled fine (see
+  #   apply_availability_status).
+  - platform: template
+    type: time
+    name: "Available From"
+    id: available_from
+    icon: "mdi:clock-start"
+    optimistic: true
+    restore_value: true
+    initial_value: "09:00:00"
+    on_value:
+      - lambda: |-
+          ESP_LOGI("schedule", "Available From changed to %02d:%02d", id(available_from).hour, id(available_from).minute);
+      - script.execute: apply_availability_status
+  - platform: template
+    type: time
+    name: "Available Until"
+    id: available_until
+    icon: "mdi:clock-end"
+    optimistic: true
+    restore_value: true
+    initial_value: "22:00:00"
+    on_value:
+      - lambda: |-
+          ESP_LOGI("schedule", "Available Until changed to %02d:%02d", id(available_until).hour, id(available_until).minute);
+      - script.execute: apply_availability_status
+
+select:
+  - platform: template
+    name: "Screen Rotation"
+    id: screen_rotation_select
+    icon: "mdi:screen-rotation"
+    entity_category: CONFIG
+    optimistic: true
+    restore_value: true
+    initial_option: "0°"
+    options:
+      - "0°"
+      - "90°"
+      - "180°"
+      - "270°"
+    set_action:
+      - script.execute:
+          id: apply_screen_rotation
+          rotation: !lambda |-
+            if (x == "90°") return 90;
+            if (x == "180°") return 180;
+            if (x == "270°") return 270;
+            return 0;
+
+switch:
+  - platform: template
+    name: "Speaker Mute"
+    id: speaker_mute
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - audio_dac.mute_on: es8311_dac
+      - lvgl.widget.update:
+          id: mute_switch
+          state:
+            checked: true
+    turn_off_action:
+      - audio_dac.mute_off: es8311_dac
+      - lvgl.widget.update:
+          id: mute_switch
+          state:
+            checked: false
+  - platform: template
+    name: "Do Not Disturb"
+    id: dnd_switch
+    icon: "mdi:bell-cancel-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: dnd_enabled
+          value: 'true'
+      - lambda: |-
+          lv_obj_add_flag(id(doorbell_icon_btn), LV_OBJ_FLAG_HIDDEN);
+    turn_off_action:
+      - globals.set:
+          id: dnd_enabled
+          value: 'false'
+      - lambda: |-
+          lv_obj_clear_flag(id(doorbell_icon_btn), LV_OBJ_FLAG_HIDDEN);
+  - platform: template
+    name: "Intercom Auto Answer"
+    id: voip_auto_answer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: auto_answer_enabled
+          value: 'true'
+      - lvgl.widget.update:
+          id: auto_answer_switch
+          state:
+            checked: true
+    turn_off_action:
+      - globals.set:
+          id: auto_answer_enabled
+          value: 'false'
+      - lvgl.widget.update:
+          id: auto_answer_switch
+          state:
+            checked: false
+  - platform: gpio
+    id: speaker_enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON
