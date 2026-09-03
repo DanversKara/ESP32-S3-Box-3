@@ -761,28 +761,28 @@ script:
   # door-lock status indicator. What tapping it does depends on that
   # same status - see lock_icon_single_tap_action below and the
   # settings_btn on_click for the full single/double-tap logic.
-  #   - locked/closed  -> solid green icon, lime circle (translucent)
-  #   - unlocked/open  -> solid red icon, orange circle (translucent)
-  # bg_opa is kept low (~35%) so the circle reads as a soft tinted glow
-  # behind the icon rather than a flat, fully opaque color swatch.
+  #   - locked/closed  -> solid RED filled lock icon, solid white circle
+  #   - unlocked/open  -> solid GREEN filled open-lock icon, solid white circle
+  # bg_opa is now fully opaque (COVER) so the circle behind the icon
+  # reads as a solid pure-white disc instead of a translucent tint.
   # ------------------------------------------------------------------
   - id: apply_door_lock_icon
     then:
       - lambda: |-
           if (id(door_alarm_door).state) {
-            // door reported open/unlocked -> red open-lock icon on a
-            // translucent orange circle
+            // door reported open/unlocked -> solid green open-lock icon
+            // on a solid white circle
             lv_label_set_text(id(settings_icon_label), "\xEE\xA2\x98"); // U+E898 lock_open
-            lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0xE74C3C), 0);
-            lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xFFA500), 0);
-            lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 90, 0);
+            lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0x00C853), 0);
+            lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 255, 0);
           } else {
-            // door reported closed/locked -> green closed-lock icon on a
-            // translucent lime circle
+            // door reported closed/locked -> solid red closed-lock icon
+            // on a solid white circle
             lv_label_set_text(id(settings_icon_label), "\xEE\xA2\x97"); // U+E897 lock
-            lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0x2ECC71), 0);
-            lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xBFFF00), 0);
-            lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 90, 0);
+            lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0xFF0000), 0);
+            lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 255, 0);
           }
   # ------------------------------------------------------------------
   # Fires 350ms after a SINGLE tap on the lock icon - long enough for a
@@ -1172,9 +1172,11 @@ font:
   #── Lock / unlock icon used in place of the settings gear so a passerby ──
   # sees "it's a lock indicator" rather than "there's a settings menu here".
   # Same font holds both glyphs so a single label can just swap its text.
-  - file: "gfonts://Material+Symbols+Outlined"
+  # Using "Material+Icons" (not "Material Symbols Outlined") so the glyphs
+  # render as solid/filled icons instead of thin outlines.
+  - file: "gfonts://Material+Icons"
     id: font_icon_lock_state
-    size: 24
+    size: 30
     glyphs: ["\uE897", "\uE898"]   # e897 = lock (closed), e898 = lock_open
 
 globals:
@@ -1639,19 +1641,22 @@ lvgl:
         - button:
             id: settings_btn
             align: TOP_RIGHT
-            x: -8
+            x: -10
             y: 8
-            width: 44
-            height: 44
-            radius: 22
-            bg_color: 0x1F2632
+            width: 56
+            height: 56
+            radius: 28
+            bg_color: 0xFFFFFF
+            bg_opa: COVER
             shadow_width: 0
             widgets:
               # Looks like a plain door-lock status icon to anyone glancing
               # at it. Its glyph/color are driven by apply_door_lock_icon
               # (see script:), based on binary_sensor.door_alarm_door - it
               # starts as a neutral gray closed-lock until the first state
-              # arrives from Home Assistant after boot.
+              # arrives from Home Assistant after boot. Sized up (56px,
+              # from 44px) and on a solid white circle so it's easier to
+              # hit and see against the dark home page background.
               - label:
                   id: settings_icon_label
                   text: "\uE897"
@@ -1701,7 +1706,7 @@ lvgl:
             id: call_return_btn
             align: TOP_RIGHT
             x: -8
-            y: 60
+            y: 72
             width: 44
             height: 44
             radius: 22
