@@ -1,0 +1,4039 @@
+{
+  "substitutions": {
+    "name": "esp32-s3box-3",
+    "friendly_name": "ESP32-S3-Box-3",
+    "friendly_name2": "PLEASE WAIT",
+    "home_assistant_host": "http://192.168.8.162:8123",
+    "api_key": "api_key",
+    "wifi_fallback_pwd": "s3box123",
+    "voip_test_account_extension": "voip_test_account_extension",
+    "voip_test_account_password": "voip_test_account_password",
+    "ha_location_name": "Home Assistant",
+    "settings_pin": "settings_pin",
+    "door_pin": "door_pin",
+    "doorbell_extension": "601",
+    "door_lock_script_entity": "script.toggle_front_door_lock",
+    "lcd_backlight_entity": "light.esp32_s3_box_3_lcd_backlight"
+  },
+  "external_components": [
+    {
+      "source": "github://eigger/espcomponents",
+      "components": [
+        "sip_client"
+      ]
+    },
+    {
+      "source": {
+        "type": "local",
+        "path": "components"
+      },
+      "components": [
+        "lvgl_screenshot"
+      ]
+    }
+  ],
+  "lvgl_screenshot": {
+    "port": 8080,
+    "jpeg_quality": 100
+  },
+  "esphome": {
+    "name": "${name}",
+    "friendly_name": "${friendly_name}",
+    "name_add_mac_suffix": false,
+    "min_version": "2024.8.0",
+    "project": {
+      "name": "kara_danvers.esp32-s3box-3",
+      "version": "2.0.0"
+    },
+    "on_boot": {
+      "priority": 600,
+      "then": [
+        {
+          "audio_dac.mute_off": "es8311_dac"
+        },
+        {
+          "audio_dac.set_volume": {
+            "id": "es8311_dac",
+            "volume": "85%"
+          }
+        },
+        {
+          "audio_adc.set_mic_gain": {
+            "id": "es7210_adc",
+            "mic_gain": "return id(mic_gain_db);"
+          }
+        },
+        {
+          "lambda": "char buf[6];\nsnprintf(buf, sizeof(buf), \"%02d:%02d\", id(available_from).hour, id(available_from).minute);\nESP_LOGI(\"schedule\", \"Boot: Available From restored as %s\", buf);\nsnprintf(buf, sizeof(buf), \"%02d:%02d\", id(available_until).hour, id(available_until).minute);\nESP_LOGI(\"schedule\", \"Boot: Available Until restored as %s\", buf);"
+        }
+      ]
+    }
+  },
+  "esp32": {
+    "board": "esp32s3box",
+    "flash_size": "16MB",
+    "cpu_frequency": "240MHz",
+    "framework": {
+      "type": "esp-idf",
+      "sdkconfig_options": {
+        "CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240": "y",
+        "CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC": "y",
+        "CONFIG_MBEDTLS_SSL_PROTO_TLS1_3": "y"
+      },
+      "advanced": {
+        "execute_from_psram": true
+      }
+    }
+  },
+  "psram": {
+    "mode": "octal",
+    "speed": "80MHz"
+  },
+  "logger": {
+    "hardware_uart": "USB_SERIAL_JTAG"
+  },
+  "wifi": {
+    "ssid": "wifi_ssid",
+    "password": "wifi_password",
+    "power_save_mode": "NONE",
+    "fast_connect": true,
+    "ap": {
+      "ssid": "${name}",
+      "password": "${wifi_fallback_pwd}"
+    },
+    "on_connect": [
+      {
+        "delay": "2s"
+      },
+      {
+        "audio_dac.set_volume": {
+          "id": "es8311_dac",
+          "volume": "85%"
+        }
+      },
+      {
+        "audio_dac.mute_off": "es8311_dac"
+      },
+      {
+        "globals.set": {
+          "id": "wifi_connected",
+          "value": "true"
+        }
+      },
+      {
+        "script.execute": "apply_dialpad_status"
+      },
+      {
+        "script.execute": "apply_wifi_status"
+      }
+    ],
+    "on_disconnect": [
+      {
+        "globals.set": {
+          "id": "wifi_connected",
+          "value": "false"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "sip_registered",
+          "value": "false"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "ha_connected",
+          "value": "false"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "api_client_count",
+          "value": "0"
+        }
+      },
+      {
+        "script.execute": "apply_dialpad_status"
+      },
+      {
+        "script.execute": "apply_home_status"
+      },
+      {
+        "script.execute": "apply_wifi_status"
+      }
+    ]
+  },
+  "captive_portal": null,
+  "api": {
+    "encryption": {
+      "key": "${api_key}"
+    },
+    "on_client_connected": {
+      "then": [
+        {
+          "lambda": "id(api_client_count) += 1;\nid(ha_connected) = true;"
+        },
+        {
+          "script.execute": "apply_home_status"
+        },
+        {
+          "script.execute": "apply_availability_status"
+        },
+        {
+          "if": {
+            "condition": {
+              "lambda": "return !id(boot_complete);"
+            },
+            "then": [
+              {
+                "globals.set": {
+                  "id": "boot_complete",
+                  "value": "true"
+                }
+              },
+              {
+                "lambda": "lv_label_set_text(id(boot_status_label), \"Connected!\");"
+              },
+              {
+                "lambda": "char buf[8];\nsnprintf(buf, sizeof(buf), \"%d%%\", id(volume_percent));\nlv_label_set_text(id(volume_percent_label), buf);\nlv_label_set_text(id(incall_speaker_vol_label), buf);"
+              },
+              {
+                "lambda": "char buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(mic_gain_label), buf);\nlv_label_set_text(id(incall_mic_gain_label), buf);"
+              },
+              {
+                "lambda": "lv_label_set_text(id(doorbell_caption_label), id(door_caption_message).state.c_str());"
+              },
+              {
+                "delay": "400ms"
+              },
+              {
+                "globals.set": {
+                  "id": "current_page",
+                  "value": "\"home\""
+                }
+              },
+              {
+                "lvgl.page.show": "home_page"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "on_client_disconnected": {
+      "then": [
+        {
+          "lambda": "if (id(api_client_count) > 0) id(api_client_count) -= 1;\nid(ha_connected) = (id(api_client_count) > 0);"
+        },
+        {
+          "script.execute": "apply_home_status"
+        }
+      ]
+    }
+  },
+  "ota": {
+    "platform": "esphome"
+  },
+  "time": {
+    "platform": "sntp",
+    "id": "sntp_time"
+  },
+  "interval": [
+    {
+      "interval": "30ms",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return !id(boot_complete);"
+          },
+          "then": [
+            {
+              "lambda": "static int angle = 0;\nangle = (angle + 6) % 360;\nlv_arc_set_rotation(id(boot_spinner_arc), angle);"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "450ms",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return !id(boot_complete);"
+          },
+          "then": [
+            {
+              "lambda": "id(boot_dot_count) = (id(boot_dot_count) + 1) % 4;\nstd::string dots(id(boot_dot_count), '.');\nstd::string txt = \"BOOTING\" + dots;\nlv_label_set_text(id(boot_status_label), txt.c_str());"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "1s",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return id(call_active);"
+          },
+          "then": [
+            {
+              "lambda": "id(call_seconds) += 1;\nint m = id(call_seconds) / 60;\nint s = id(call_seconds) % 60;\nchar buf[10];\nsnprintf(buf, sizeof(buf), \"%02d:%02d\", m, s);\nlv_label_set_text(id(call_timer_label), buf);"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "500ms",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return id(call_in_progress);"
+          },
+          "then": [
+            {
+              "lambda": "// Pulsing amber \"return to call\" badge - the bg_color and\n// shadow both breathe between a bright and dim amber so the\n// glow looks like it's coming from behind the icon rather\n// than just a flat blink.\nlv_obj_clear_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);\nid(call_return_blink) = !id(call_return_blink);\nif (id(call_return_blink)) {\n  lv_obj_set_style_bg_color(id(call_return_btn), lv_color_hex(0xFFC107), 0);\n  lv_obj_set_style_shadow_color(id(call_return_btn), lv_color_hex(0xFFD65C), 0);\n  lv_obj_set_style_shadow_width(id(call_return_btn), 26, 0);\n  lv_obj_set_style_shadow_spread(id(call_return_btn), 6, 0);\n  lv_obj_set_style_shadow_opa(id(call_return_btn), 255, 0);\n} else {\n  lv_obj_set_style_bg_color(id(call_return_btn), lv_color_hex(0xC9860A), 0);\n  lv_obj_set_style_shadow_color(id(call_return_btn), lv_color_hex(0xFFC107), 0);\n  lv_obj_set_style_shadow_width(id(call_return_btn), 12, 0);\n  lv_obj_set_style_shadow_spread(id(call_return_btn), 1, 0);\n  lv_obj_set_style_shadow_opa(id(call_return_btn), 140, 0);\n}"
+            }
+          ],
+          "else": [
+            {
+              "lambda": "lv_obj_add_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "600ms",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return !id(ha_connected);"
+          },
+          "then": [
+            {
+              "lambda": "static bool bright = false;\nbright = !bright;\nuint32_t c = bright ? 0xE74C3C : 0x7A1F17;\nlv_obj_set_style_text_color(id(doorbell_unavailable_label), lv_color_hex(c), 0);"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "150ms",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return id(ha_connected);"
+          },
+          "then": [
+            {
+              "lambda": "uint32_t rnd = random_uint32();\nuint8_t r = 170 + (rnd % 86);\nuint8_t r_dim = (r > 70) ? (r - 70) : r;\nlv_obj_set_style_bg_color(id(doorbell_icon_btn), lv_color_hex((uint32_t)r << 16), 0);\nlv_obj_set_style_shadow_color(id(doorbell_icon_btn), lv_color_hex((uint32_t)r_dim << 16), 0);\nlv_obj_set_style_shadow_width(id(doorbell_icon_btn), 20 + (rnd % 26), 0);\nlv_obj_set_style_shadow_spread(id(doorbell_icon_btn), 6, 0);\nlv_obj_set_style_shadow_opa(id(doorbell_icon_btn), 130 + (rnd % 100), 0);"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "180ms",
+      "then": {
+        "if": {
+          "condition": {
+            "lambda": "return id(current_page) == \"home\";"
+          },
+          "then": [
+            {
+              "lambda": "static lv_obj_t* cols[12] = {\n  id(matrix_col_0), id(matrix_col_1), id(matrix_col_2),\n  id(matrix_col_3), id(matrix_col_4), id(matrix_col_5),\n  id(matrix_col_6), id(matrix_col_7), id(matrix_col_8),\n  id(matrix_col_9), id(matrix_col_10), id(matrix_col_11)\n};\nstatic int16_t col_y[12] = { -260, -40, -180, -300, -10, -220,\n                              -60, -260, -120, -20, -200, -100 };\nstatic uint8_t tick = 0;\ntick++;\nfor (int i = 0; i < 12; i++) {\n  col_y[i] += 6;\n  if (col_y[i] > 260) col_y[i] = -280;\n  lv_obj_set_y(cols[i], col_y[i]);\n  if (((tick + i) % 14) == 0) {\n    std::string s;\n    for (int r = 0; r < 16; r++) {\n      s += std::to_string(random_uint32() % 10);\n      if (r != 15) s += \"\\n\";\n    }\n    lv_label_set_text(cols[i], s.c_str());\n  }\n}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "interval": "30s",
+      "then": [
+        {
+          "script.execute": "apply_availability_status"
+        }
+      ]
+    }
+  ],
+  "esp32_ble_tracker": null,
+  "bluetooth_proxy": {
+    "active": true
+  },
+  "i2c": [
+    {
+      "id": "bus_a",
+      "sda": "GPIO08",
+      "scl": "GPIO18",
+      "scan": true,
+      "frequency": "100kHz"
+    },
+    {
+      "id": "bus_b",
+      "sda": "GPIO41",
+      "scl": "GPIO40",
+      "scan": true,
+      "frequency": "100kHz"
+    }
+  ],
+  "output": [
+    {
+      "platform": "ledc",
+      "pin": "GPIO47",
+      "id": "backlight_output"
+    }
+  ],
+  "light": [
+    {
+      "platform": "monochromatic",
+      "id": "led",
+      "name": "LCD Backlight",
+      "output": "backlight_output",
+      "restore_mode": "ALWAYS_ON"
+    }
+  ],
+  "number": [
+    {
+      "platform": "template",
+      "name": "Banner Height",
+      "id": "banner_height_num",
+      "icon": "mdi:arrow-expand-vertical",
+      "unit_of_measurement": "px",
+      "min_value": 20,
+      "max_value": 290,
+      "step": 1,
+      "initial_value": 70,
+      "optimistic": true,
+      "restore_value": true,
+      "on_value": [
+        {
+          "lambda": "// Bottom edge is pinned via BOTTOM_MID align, y: -6 (see the\n// availability_banner widget) - 6px up from the true bottom.\n// Clamp the top edge so it can ride up past the down-arrow\n// (~y=40, so stop just clear of it at ~y=32) but no further,\n// on whichever canvas height is actually active right now.\nint requested = (int) x;\nlv_coord_t disp_h = lv_disp_get_ver_res(NULL);\nint max_reachable = (int) disp_h - 6 - 32;\nint h = requested > max_reachable ? max_reachable : requested;\nlv_obj_set_height(id(availability_banner), h);"
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "name": "Banner Width",
+      "id": "banner_width_num",
+      "icon": "mdi:arrow-expand-horizontal",
+      "unit_of_measurement": "%",
+      "min_value": 50,
+      "max_value": 100,
+      "step": 1,
+      "initial_value": 92,
+      "optimistic": true,
+      "restore_value": true,
+      "on_value": [
+        {
+          "lambda": "lv_obj_set_width(id(availability_banner), lv_pct((int) x));"
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "name": "Banner Background Opacity",
+      "id": "banner_bg_opacity_num",
+      "icon": "mdi:opacity",
+      "unit_of_measurement": "%",
+      "min_value": 0,
+      "max_value": 100,
+      "step": 1,
+      "initial_value": 92,
+      "optimistic": true,
+      "restore_value": true,
+      "on_value": [
+        {
+          "lambda": "lv_obj_set_style_bg_opa(id(availability_banner), (lv_opa_t) ((x / 100.0) * 255), 0);"
+        }
+      ]
+    }
+  ],
+  "sensor": [
+    {
+      "platform": "adc",
+      "pin": "GPIO10",
+      "id": "battery_voltage",
+      "unit_of_measurement": "V",
+      "accuracy_decimals": 2,
+      "device_class": "voltage",
+      "entity_category": "diagnostic",
+      "update_interval": "30s",
+      "attenuation": "auto",
+      "filters": [
+        {
+          "multiply": 4.11
+        }
+      ]
+    },
+    {
+      "platform": "copy",
+      "id": "battery_percent",
+      "source_id": "battery_voltage",
+      "name": "Battery Level",
+      "unit_of_measurement": "%",
+      "accuracy_decimals": 0,
+      "device_class": "battery",
+      "entity_category": "diagnostic",
+      "filters": [
+        {
+          "lambda": "return (x - 2.7) / (4.2 - 2.7) * 100;"
+        },
+        {
+          "clamp": {
+            "min_value": 0,
+            "max_value": 100
+          }
+        }
+      ]
+    }
+  ],
+  "i2s_audio": [
+    {
+      "id": "mic_bus",
+      "i2s_lrclk_pin": {
+        "number": "GPIO45",
+        "ignore_strapping_warning": true,
+        "allow_other_uses": true
+      },
+      "i2s_bclk_pin": {
+        "number": "GPIO17",
+        "allow_other_uses": true
+      },
+      "i2s_mclk_pin": {
+        "number": "GPIO2",
+        "allow_other_uses": true
+      }
+    },
+    {
+      "id": "speaker_bus",
+      "i2s_lrclk_pin": {
+        "number": "GPIO45",
+        "ignore_strapping_warning": true,
+        "allow_other_uses": true
+      },
+      "i2s_bclk_pin": {
+        "number": "GPIO17",
+        "allow_other_uses": true
+      },
+      "i2s_mclk_pin": {
+        "number": "GPIO2",
+        "allow_other_uses": true
+      }
+    }
+  ],
+  "audio_adc": {
+    "platform": "es7210",
+    "id": "es7210_adc",
+    "i2c_id": "bus_a",
+    "bits_per_sample": "16bit",
+    "sample_rate": 16000
+  },
+  "audio_dac": {
+    "platform": "es8311",
+    "id": "es8311_dac",
+    "i2c_id": "bus_a",
+    "bits_per_sample": "16bit",
+    "sample_rate": 16000
+  },
+  "microphone": [
+    {
+      "platform": "i2s_audio",
+      "id": "box_mic",
+      "i2s_audio_id": "mic_bus",
+      "i2s_mode": "secondary",
+      "sample_rate": 16000,
+      "i2s_din_pin": "GPIO16",
+      "bits_per_sample": "16bit",
+      "channel": "right",
+      "adc_type": "external"
+    }
+  ],
+  "speaker": [
+    {
+      "id": "i2s_audio_speaker",
+      "platform": "i2s_audio",
+      "i2s_audio_id": "speaker_bus",
+      "i2s_mode": "primary",
+      "i2s_dout_pin": "GPIO15",
+      "dac_type": "external",
+      "sample_rate": 16000,
+      "bits_per_sample": "16bit",
+      "channel": "mono",
+      "audio_dac": "es8311_dac",
+      "buffer_duration": "100ms"
+    },
+    {
+      "platform": "resampler",
+      "id": "voip_speaker",
+      "output_speaker": "i2s_audio_speaker",
+      "sample_rate": 16000
+    }
+  ],
+  "rtttl": [
+    {
+      "id": "ringtone",
+      "speaker": "i2s_audio_speaker",
+      "gain": 0.6,
+      "on_finished_playback": [
+        {
+          "logger.log": "rtttl: finished playback callback fired"
+        },
+        {
+          "delay": "800ms"
+        },
+        {
+          "if": {
+            "condition": {
+              "lambda": "return id(current_page) == \"incall\" && !id(call_active);"
+            },
+            "then": [
+              {
+                "logger.log": "rtttl: still ringing, replaying"
+              },
+              {
+                "rtttl.play": {
+                  "id": "ringtone",
+                  "rtttl": "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "button": [
+    {
+      "platform": "template",
+      "name": "Test Ringtone",
+      "entity_category": "diagnostic",
+      "on_press": [
+        {
+          "logger.log": "rtttl: manual test triggered"
+        },
+        {
+          "rtttl.play": {
+            "id": "ringtone",
+            "rtttl": "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+          }
+        }
+      ]
+    }
+  ],
+  "script": [
+    {
+      "id": "apply_screen_rotation",
+      "parameters": {
+        "rotation": "int"
+      },
+      "then": [
+        {
+          "globals.set": {
+            "id": "screen_rotation_deg",
+            "value": "return rotation;"
+          }
+        },
+        {
+          "lvgl.display.set_rotation": {
+            "rotation": "return rotation;"
+          }
+        },
+        {
+          "script.execute": "apply_dialpad_layout"
+        },
+        {
+          "script.execute": "apply_pinpad_layout"
+        },
+        {
+          "script.execute": "apply_settings_layout"
+        },
+        {
+          "script.execute": "apply_incall_layout"
+        },
+        {
+          "script.execute": "apply_audio_mic_layout"
+        },
+        {
+          "script.execute": "apply_lcd_brightness_layout"
+        }
+      ]
+    },
+    {
+      "id": "apply_dialpad_layout",
+      "then": [
+        {
+          "lambda": "bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);\n\nint col_x_land[3]  = {10, 112, 214};\nint col_x_port[3]  = {8, 85, 162};\nint col_w_land = 96, col_w_port = 69;\nint row_h_land = 36, row_h_port = 40;\nint row_y_land[4] = {28, 68, 108, 148};\nint row_y_port[4] = {40, 86, 132, 178};\nint bottom_y_land = 192, bottom_h_land = 40;\nint bottom_y_port = 222, bottom_h_port = 48;\n\nint *col_x = portrait ? col_x_port : col_x_land;\nint col_w = portrait ? col_w_port : col_w_land;\nint row_h = portrait ? row_h_port : row_h_land;\nint *row_y = portrait ? row_y_port : row_y_land;\nint bottom_y = portrait ? bottom_y_port : bottom_y_land;\nint bottom_h = portrait ? bottom_h_port : bottom_h_land;\n\nlv_obj_t *grid[12] = {\n  id(dial_btn_1), id(dial_btn_2), id(dial_btn_3),\n  id(dial_btn_4), id(dial_btn_5), id(dial_btn_6),\n  id(dial_btn_7), id(dial_btn_8), id(dial_btn_9),\n  id(dial_btn_star), id(dial_btn_0), id(dial_btn_hash),\n};\nfor (int i = 0; i < 12; i++) {\n  int row = i / 3, col = i % 3;\n  lv_obj_set_pos(grid[i], col_x[col], row_y[row]);\n  lv_obj_set_size(grid[i], col_w, row_h);\n}\n\nlv_obj_set_pos(id(dialpad_call_btn), col_x[0], bottom_y);\nlv_obj_set_size(id(dialpad_call_btn), col_w, bottom_h);\nlv_obj_set_pos(id(dialpad_end_btn), col_x[1], bottom_y);\nlv_obj_set_size(id(dialpad_end_btn), col_w, bottom_h);\nlv_obj_set_pos(id(dialpad_homepage_btn), col_x[2], bottom_y);\nlv_obj_set_size(id(dialpad_homepage_btn), col_w, bottom_h);"
+        }
+      ]
+    },
+    {
+      "id": "apply_pinpad_layout",
+      "then": [
+        {
+          "lambda": "bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);\n\nint col_x_land[3]  = {10, 112, 214};\nint col_x_port[3]  = {8, 85, 162};\nint col_w_land = 96, col_w_port = 69;\nint row_h_land = 36, row_h_port = 40;\nint row_y_land[4] = {50, 90, 130, 170};\nint row_y_port[4] = {66, 112, 158, 204};\n\nint *col_x = portrait ? col_x_port : col_x_land;\nint col_w = portrait ? col_w_port : col_w_land;\nint row_h = portrait ? row_h_port : row_h_land;\nint *row_y = portrait ? row_y_port : row_y_land;\n\nlv_obj_t *grid[12] = {\n  id(settings_pin_1), id(settings_pin_2), id(settings_pin_3),\n  id(settings_pin_4), id(settings_pin_5), id(settings_pin_6),\n  id(settings_pin_7), id(settings_pin_8), id(settings_pin_9),\n  id(settings_pin_clear), id(settings_pin_0), id(settings_pin_enter),\n};\nfor (int i = 0; i < 12; i++) {\n  int row = i / 3, col = i % 3;\n  lv_obj_set_pos(grid[i], col_x[col], row_y[row]);\n  lv_obj_set_size(grid[i], col_w, row_h);\n}"
+        }
+      ]
+    },
+    {
+      "id": "apply_settings_layout",
+      "then": [
+        {
+          "lambda": "bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);\nint w = portrait ? 220 : 300;\n\nlv_obj_t *rows[5] = {\n  id(settings_unlock_door_btn), id(settings_dialpad_btn),\n  id(settings_audio_mic_btn), id(settings_lcd_brightness_btn),\n  id(settings_homepage_exit_btn),\n};\nfor (int i = 0; i < 5; i++) {\n  lv_obj_set_width(rows[i], w);\n}"
+        }
+      ]
+    },
+    {
+      "id": "apply_incall_layout",
+      "then": [
+        {
+          "lambda": "bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);\n\nint minus_x = portrait ? 120 : 165;\nint label_x = portrait ? 161 : 206;\nint plus_x  = portrait ? 196 : 254;\nint screen_w = portrait ? 240 : 320;\nint screen_h = portrait ? 320 : 240;\n\nlv_obj_set_x(id(incall_speaker_down_btn), minus_x);\nlv_obj_set_x(id(incall_speaker_vol_label), label_x);\nlv_obj_set_x(id(incall_speaker_up_btn), plus_x);\nlv_obj_set_x(id(incall_mic_down_btn), minus_x);\nlv_obj_set_x(id(incall_mic_gain_label), label_x);\nlv_obj_set_x(id(incall_mic_up_btn), plus_x);\n\nlv_obj_set_y(id(call_timer_label), portrait ? 130 : 92);\nlv_obj_set_y(id(incall_status_label), portrait ? 190 : 150);\n\nlv_obj_set_size(id(answer_btn), screen_w, 44);\nlv_obj_set_pos(id(answer_btn), 0, screen_h - 44);"
+        }
+      ]
+    },
+    {
+      "id": "apply_audio_mic_layout",
+      "then": [
+        {
+          "lambda": "bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);\nint switch_x = portrait ? 170 : 250;\nint plus_x   = portrait ? 176 : 256;\n\nlv_obj_set_x(id(auto_answer_switch), switch_x);\nlv_obj_set_x(id(mute_switch), switch_x);\nlv_obj_set_x(id(volume_up_btn), plus_x);\nlv_obj_set_x(id(mic_gain_up_btn), plus_x);"
+        }
+      ]
+    },
+    {
+      "id": "apply_lcd_brightness_layout",
+      "then": [
+        {
+          "lambda": "bool portrait = (id(screen_rotation_deg) == 90 || id(screen_rotation_deg) == 270);\n\nlv_obj_set_width(id(lcd_brightness_slider), portrait ? 220 : 300);\nlv_obj_set_y(id(back_from_lcd_brightness_btn), portrait ? 150 : 80);"
+        }
+      ]
+    },
+    {
+      "id": "apply_home_status",
+      "then": [
+        {
+          "lambda": "if (id(ha_connected)) {\n  lv_obj_add_flag(id(doorbell_unavailable_overlay), LV_OBJ_FLAG_HIDDEN);\n} else {\n  lv_obj_clear_flag(id(doorbell_unavailable_overlay), LV_OBJ_FLAG_HIDDEN);\n}"
+        }
+      ]
+    },
+    {
+      "id": "apply_wifi_status",
+      "then": [
+        {
+          "lambda": "if (id(wifi_connected)) {\n  lv_obj_add_flag(id(stolen_overlay), LV_OBJ_FLAG_HIDDEN);\n} else {\n  lv_obj_clear_flag(id(stolen_overlay), LV_OBJ_FLAG_HIDDEN);\n}"
+        }
+      ]
+    },
+    {
+      "id": "apply_door_lock_icon",
+      "then": [
+        {
+          "lambda": "if (id(door_alarm_door).state) {\n  // door reported open/unlocked -> solid green open-lock icon\n  // on a solid white circle\n  lv_label_set_text(id(settings_icon_label), \"\\xEE\\xA2\\x98\"); // U+E898 lock_open\n  lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0x00C853), 0);\n  lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xFFFFFF), 0);\n  lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 255, 0);\n} else {\n  // door reported closed/locked -> solid red closed-lock icon\n  // on a solid white circle\n  lv_label_set_text(id(settings_icon_label), \"\\xEE\\xA2\\x97\"); // U+E897 lock\n  lv_obj_set_style_text_color(id(settings_icon_label), lv_color_hex(0xFF0000), 0);\n  lv_obj_set_style_bg_color(id(settings_btn), lv_color_hex(0xFFFFFF), 0);\n  lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 255, 0);\n}"
+        }
+      ]
+    },
+    {
+      "id": "lock_icon_single_tap_action",
+      "mode": "restart",
+      "then": [
+        {
+          "delay": "350ms"
+        },
+        {
+          "lambda": "ESP_LOGI(\"lock_icon\", \"single-tap resolved: door_alarm_door.state=%s -> %s\",\n         id(door_alarm_door).state ? \"true (open/unlocked)\" : \"false (closed/locked)\",\n         id(door_alarm_door).state ? \"TOGGLING LOCK\" : \"OPENING PIN PAD\");"
+        },
+        {
+          "if": {
+            "condition": {
+              "lambda": "return id(door_alarm_door).state;"
+            },
+            "then": [
+              {
+                "if": {
+                  "condition": {
+                    "api.connected": {}
+                  },
+                  "then": [
+                    {
+                      "homeassistant.service": {
+                        "service": "script.turn_on",
+                        "data": {
+                          "entity_id": "${door_lock_script_entity}"
+                        },
+                        "on_error": [
+                          {
+                            "logger.log": {
+                              "format": "HA service error (script.turn_on door lock via single-tap): %s",
+                              "args": [
+                                "error.c_str()"
+                              ],
+                              "tag": "ha_service"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "else": [
+                    {
+                      "logger.log": {
+                        "format": "Skipped HA service call: no API connection",
+                        "tag": "ha_service"
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "else": [
+              {
+                "globals.set": {
+                  "id": "pin_buffer",
+                  "value": "\"\""
+                }
+              },
+              {
+                "globals.set": {
+                  "id": "current_page",
+                  "value": "\"settings_pin\""
+                }
+              },
+              {
+                "lambda": "lv_label_set_text(id(settings_pin_display), \"\");"
+              },
+              {
+                "lvgl.page.show": "settings_pin_page"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "apply_dialpad_status",
+      "then": [
+        {
+          "lambda": "uint32_t c = (id(wifi_connected) && id(sip_registered)) ? 0x2ECC71 : 0xE74C3C;\nlv_obj_set_style_text_color(id(settings_dialpad_label), lv_color_hex(c), 0);"
+        }
+      ]
+    },
+    {
+      "id": "doorbell_press",
+      "then": [
+        {
+          "if": {
+            "condition": {
+              "lambda": "return id(ha_connected) && id(wifi_connected) && !id(call_in_progress) && !id(dnd_enabled);"
+            },
+            "then": [
+              {
+                "lambda": "// brief white flash for tactile confirmation the press registered\n// (the 700ms pulse interval takes back over on its next tick)\nlv_obj_set_style_bg_color(id(doorbell_icon_btn), lv_color_hex(0xFFFFFF), 0);"
+              },
+              {
+                "globals.set": {
+                  "id": "call_is_outgoing",
+                  "value": "true"
+                }
+              },
+              {
+                "globals.set": {
+                  "id": "call_in_progress",
+                  "value": "true"
+                }
+              },
+              {
+                "globals.set": {
+                  "id": "call_seconds",
+                  "value": "0"
+                }
+              },
+              {
+                "lambda": "lv_label_set_text(id(incall_status_label), \"RINGING RESIDENCE...\");\nlv_label_set_text(id(call_timer_label), \"00:00\");\nlv_label_set_text(id(answer_btn_label), \"CANCEL\");\nlv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);\nchar buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(incall_mic_gain_label), buf);"
+              },
+              {
+                "globals.set": {
+                  "id": "current_page",
+                  "value": "\"incall\""
+                }
+              },
+              {
+                "lvgl.page.show": "incall_page"
+              },
+              {
+                "sip_client.call": {
+                  "id": "phone",
+                  "number": "${doorbell_extension}"
+                }
+              }
+            ],
+            "else": [
+              {
+                "logger.log": "Doorbell press ignored: not connected, a call is already in progress, or Do Not Disturb is on"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "apply_availability_status",
+      "then": [
+        {
+          "lambda": "auto now = id(sntp_time).now();\nif (!now.is_valid()) return;\nint now_min = now.hour * 60 + now.minute;\nint from_min = id(available_from).hour * 60 + id(available_from).minute;\nint until_min = id(available_until).hour * 60 + id(available_until).minute;\n\nbool available;\nif (from_min <= until_min) {\n  available = (now_min >= from_min && now_min < until_min);\n} else {\n  // Window wraps past midnight.\n  available = (now_min >= from_min || now_min < until_min);\n}\n\nstd::string msg = available ? id(available_message).state : id(unavailable_message).state;\nuint32_t bg     = available ? 0x123D22 : 0x3D1414;\nuint32_t border = available ? 0x2ECC71 : 0xE74C3C;\n\nlv_label_set_text(id(availability_banner_label), msg.c_str());\nlv_obj_set_style_bg_color(id(availability_banner), lv_color_hex(bg), 0);\nlv_obj_set_style_border_color(id(availability_banner), lv_color_hex(border), 0);\n\nif (id(schedule_check_initialized)) {\n  if (available && !id(schedule_was_available)) {\n    // Just crossed Available From.\n    id(dnd_switch).turn_off();\n    id(banner_height_num).make_call().set_value(35).perform();\n  } else if (!available && id(schedule_was_available)) {\n    // Just crossed Available Until.\n    id(dnd_switch).turn_on();\n    id(banner_height_num).make_call().set_value(290).perform();\n  }\n}\nid(schedule_was_available) = available;\nid(schedule_check_initialized) = true;"
+        }
+      ]
+    }
+  ],
+  "sip_client": {
+    "id": "phone",
+    "server": "192.168.8.220",
+    "username": "${voip_test_account_extension}",
+    "password": "${voip_test_account_password}",
+    "microphone": "box_mic",
+    "speaker": "voip_speaker",
+    "channel": "mono",
+    "on_registered": [
+      {
+        "logger.log": "SIP: registered with server"
+      },
+      {
+        "globals.set": {
+          "id": "sip_registered",
+          "value": "true"
+        }
+      },
+      {
+        "script.execute": "apply_dialpad_status"
+      }
+    ],
+    "on_incoming_call": [
+      {
+        "logger.log": {
+          "format": "Incoming call from %s",
+          "args": [
+            "caller.c_str()"
+          ]
+        }
+      },
+      {
+        "globals.set": {
+          "id": "current_page",
+          "value": "\"incall\""
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_seconds",
+          "value": "0"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_in_progress",
+          "value": "true"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_is_outgoing",
+          "value": "false"
+        }
+      },
+      {
+        "lambda": "lv_label_set_text(id(incall_status_label), \"RINGING...\");\nlv_label_set_text(id(call_timer_label), \"00:00\");\nlv_label_set_text(id(answer_btn_label), \"ANSWER\");\nlv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0x2ECC71), 0);\nchar buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(incall_mic_gain_label), buf);"
+      },
+      {
+        "lvgl.page.show": "incall_page"
+      },
+      {
+        "light.turn_on": {
+          "id": "led",
+          "flash_length": "500ms"
+        }
+      },
+      {
+        "if": {
+          "condition": {
+            "lambda": "return id(auto_answer_enabled);"
+          },
+          "then": [
+            {
+              "sip_client.answer": "phone"
+            }
+          ],
+          "else": [
+            {
+              "logger.log": "rtttl: playing ring for incoming call"
+            },
+            {
+              "rtttl.play": {
+                "id": "ringtone",
+                "rtttl": "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "on_call_connected": [
+      {
+        "rtttl.stop": {
+          "id": "ringtone"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_active",
+          "value": "true"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_is_outgoing",
+          "value": "false"
+        }
+      },
+      {
+        "lambda": "lv_label_set_text(id(incall_status_label), \"CONNECTED\");\nlv_label_set_text(id(answer_btn_label), \"END CALL\");\nlv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);"
+      }
+    ],
+    "on_call_ended": [
+      {
+        "rtttl.stop": {
+          "id": "ringtone"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_active",
+          "value": "false"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_in_progress",
+          "value": "false"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_is_outgoing",
+          "value": "false"
+        }
+      },
+      {
+        "globals.set": {
+          "id": "current_page",
+          "value": "\"home\""
+        }
+      },
+      {
+        "globals.set": {
+          "id": "call_seconds",
+          "value": "0"
+        }
+      },
+      {
+        "lambda": "id(dial_buffer) = \"\";\nlv_label_set_text(id(call_timer_label), \"00:00\");\nlv_label_set_text(id(answer_btn_label), \"ANSWER\");\nlv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0x2ECC71), 0);\n// Whatever mic level the caller landed on mid-call is now saved as\n// the standing setting (mic_gain_db has restore_value: true, so it\n// survives reboots) - just make sure the Settings page reflects it.\nchar buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(mic_gain_label), buf);"
+      },
+      {
+        "script.execute": "apply_home_status"
+      },
+      {
+        "lvgl.page.show": "home_page"
+      }
+    ]
+  },
+  "binary_sensor": [
+    {
+      "platform": "gpio",
+      "pin": {
+        "number": "GPIO0",
+        "mode": "INPUT_PULLUP",
+        "inverted": true,
+        "ignore_strapping_warning": true
+      },
+      "id": "side_top_button",
+      "on_multi_click": [
+        {
+          "timing": [
+            "ON for at most 1s"
+          ],
+          "then": {
+            "if": {
+              "condition": {
+                "lambda": "return id(call_active);"
+              },
+              "then": [
+                {
+                  "sip_client.hangup": "phone"
+                }
+              ],
+              "else": [
+                {
+                  "if": {
+                    "condition": {
+                      "lambda": "return id(current_page) != \"home\";"
+                    },
+                    "then": [
+                      {
+                        "globals.set": {
+                          "id": "current_page",
+                          "value": "\"home\""
+                        }
+                      },
+                      {
+                        "lvgl.page.show": "home_page"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "timing": [
+            "ON for at least 1s"
+          ],
+          "then": [
+            {
+              "sip_client.hangup": "phone"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "platform": "homeassistant",
+      "id": "door_alarm_door",
+      "entity_id": "binary_sensor.door_alarm_door",
+      "on_state": {
+        "then": [
+          {
+            "script.execute": "apply_door_lock_icon"
+          }
+        ]
+      }
+    },
+    {
+      "platform": "gpio",
+      "pin": {
+        "number": "GPIO1",
+        "mode": "INPUT_PULLUP",
+        "inverted": true
+      },
+      "id": "hw_mute_switch",
+      "name": "Mic Mute Switch",
+      "entity_category": "diagnostic",
+      "on_state": {
+        "then": [
+          {
+            "if": {
+              "condition": {
+                "binary_sensor.is_on": "hw_mute_switch"
+              },
+              "then": [
+                {
+                  "logger.log": "Hardware mute engaged"
+                }
+              ],
+              "else": [
+                {
+                  "logger.log": "Hardware mute released"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "platform": "gt911",
+      "name": "Home Button",
+      "index": 0,
+      "on_press": {
+        "if": {
+          "condition": {
+            "lambda": "return id(call_active) || id(call_is_outgoing);"
+          },
+          "then": [
+            {
+              "sip_client.hangup": "phone"
+            }
+          ],
+          "else": [
+            {
+              "if": {
+                "condition": {
+                  "lambda": "return id(current_page) == \"home\";"
+                },
+                "then": [
+                  {
+                    "script.execute": "doorbell_press"
+                  }
+                ],
+                "else": [
+                  {
+                    "globals.set": {
+                      "id": "current_page",
+                      "value": "\"home\""
+                    }
+                  },
+                  {
+                    "lvgl.page.show": "home_page"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "spi": [
+    {
+      "id": "spi_bus",
+      "clk_pin": 7,
+      "mosi_pin": 6
+    }
+  ],
+  "font": [
+    {
+      "file": "gfonts://Roboto",
+      "id": "font_large",
+      "size": 40
+    },
+    {
+      "file": "gfonts://Roboto",
+      "id": "font_medium",
+      "size": 22
+    },
+    {
+      "file": "gfonts://Roboto",
+      "id": "font_small",
+      "size": 16
+    },
+    {
+      "file": "gfonts://Roboto",
+      "id": "font_clock",
+      "size": 48,
+      "glyphs": "0123456789:APM "
+    },
+    {
+      "file": "gfonts://Roboto@700",
+      "id": "font_clock_bold",
+      "size": 52,
+      "glyphs": "0123456789:APM "
+    },
+    {
+      "file": "gfonts://Roboto@700",
+      "id": "font_medium_bold",
+      "size": 24
+    },
+    {
+      "file": "gfonts://Roboto@700",
+      "id": "font_large_bold",
+      "size": 40
+    },
+    {
+      "file": "gfonts://Material+Icons",
+      "id": "font_icon_lock_state",
+      "size": 30,
+      "glyphs": [
+        "",
+        ""
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "id": "dial_buffer",
+      "type": "std::string",
+      "restore_value": false,
+      "initial_value": "\"\""
+    },
+    {
+      "id": "auto_answer_enabled",
+      "type": "bool",
+      "restore_value": true,
+      "initial_value": "false"
+    },
+    {
+      "id": "current_page",
+      "type": "std::string",
+      "restore_value": false,
+      "initial_value": "\"home\""
+    },
+    {
+      "id": "call_active",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "call_in_progress",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "call_is_outgoing",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "pin_buffer",
+      "type": "std::string",
+      "restore_value": false,
+      "initial_value": "\"\""
+    },
+    {
+      "id": "lock_icon_last_tap_ms",
+      "type": "uint32_t",
+      "restore_value": false,
+      "initial_value": "0"
+    },
+    {
+      "id": "lock_icon_last_tap_is_double",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "boot_complete",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "boot_dot_count",
+      "type": "int",
+      "restore_value": false,
+      "initial_value": "0"
+    },
+    {
+      "id": "volume_percent",
+      "type": "int",
+      "restore_value": true,
+      "initial_value": "70"
+    },
+    {
+      "id": "mic_gain_db",
+      "type": "float",
+      "restore_value": true,
+      "initial_value": "24.0"
+    },
+    {
+      "id": "call_seconds",
+      "type": "int",
+      "restore_value": false,
+      "initial_value": "0"
+    },
+    {
+      "id": "call_return_blink",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "wifi_connected",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "sip_registered",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "ha_connected",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "api_client_count",
+      "type": "int",
+      "restore_value": false,
+      "initial_value": "0"
+    },
+    {
+      "id": "screen_rotation_deg",
+      "type": "int",
+      "restore_value": true,
+      "initial_value": "0"
+    },
+    {
+      "id": "schedule_was_available",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "true"
+    },
+    {
+      "id": "schedule_check_initialized",
+      "type": "bool",
+      "restore_value": false,
+      "initial_value": "false"
+    },
+    {
+      "id": "dnd_enabled",
+      "type": "bool",
+      "restore_value": true,
+      "initial_value": "false"
+    }
+  ],
+  "display": [
+    {
+      "platform": "mipi_spi",
+      "id": "s3_box_lcd",
+      "model": "S3BOX",
+      "data_rate": "40MHz",
+      "cs_pin": 5,
+      "dc_pin": 4,
+      "reset_pin": {
+        "number": 48,
+        "inverted": true
+      },
+      "color_order": "bgr",
+      "invert_colors": false
+    }
+  ],
+  "touchscreen": [
+    {
+      "platform": "gt911",
+      "id": "box_touch",
+      "i2c_id": "bus_a",
+      "display": "s3_box_lcd"
+    }
+  ],
+  "lvgl": {
+    "id": "lv",
+    "displays": [
+      "s3_box_lcd"
+    ],
+    "touchscreens": [
+      "box_touch"
+    ],
+    "rotation": 0,
+    "on_boot": {
+      "then": [
+        {
+          "script.execute": {
+            "id": "apply_screen_rotation",
+            "rotation": "return id(screen_rotation_deg);"
+          }
+        }
+      ]
+    },
+    "pages": [
+      {
+        "id": "boot_page",
+        "bg_color": 0,
+        "widgets": [
+          {
+            "label": {
+              "text": "${friendly_name2}",
+              "text_font": "font_medium",
+              "text_color": 16777215,
+              "align": "CENTER",
+              "y": -60
+            }
+          },
+          {
+            "arc": {
+              "id": "boot_spinner_arc",
+              "align": "CENTER",
+              "y": 10,
+              "width": 70,
+              "height": 70,
+              "min_value": 0,
+              "max_value": 100,
+              "value": 25,
+              "start_angle": 0,
+              "end_angle": 360,
+              "rotation": 0,
+              "adjustable": false,
+              "arc_width": 6,
+              "bg_opa": "TRANSP",
+              "indicator": {
+                "arc_color": 4029439,
+                "arc_width": 6,
+                "arc_rounded": true
+              }
+            }
+          },
+          {
+            "label": {
+              "id": "boot_status_label",
+              "text": "BOOTING",
+              "text_font": "font_small",
+              "text_color": 12042444,
+              "align": "CENTER",
+              "y": 62
+            }
+          }
+        ]
+      },
+      {
+        "id": "home_page",
+        "bg_color": 0,
+        "widgets": [
+          {
+            "label": {
+              "id": "matrix_col_0",
+              "text": "3\n7\n1\n9\n4\n0\n8\n2\n6\n5\n1\n7\n3\n9\n0\n6",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 2,
+              "y": -260
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_1",
+              "text": "8\n2\n5\n0\n7\n1\n4\n9\n3\n6\n2\n8\n5\n0\n1\n4",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 30,
+              "y": -40
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_2",
+              "text": "1\n6\n9\n3\n0\n5\n8\n2\n4\n7\n1\n6\n9\n3\n0\n5",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 58,
+              "y": -180
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_3",
+              "text": "4\n0\n7\n2\n9\n6\n1\n8\n5\n3\n4\n0\n7\n2\n9\n6",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 86,
+              "y": -300
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_4",
+              "text": "9\n5\n2\n8\n1\n4\n0\n6\n3\n7\n9\n5\n2\n8\n1\n4",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 114,
+              "y": -10
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_5",
+              "text": "0\n8\n4\n1\n6\n3\n9\n5\n2\n7\n0\n8\n4\n1\n6\n3",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 142,
+              "y": -220
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_6",
+              "text": "6\n1\n3\n9\n5\n0\n7\n4\n8\n2\n6\n1\n3\n9\n5\n0",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 170,
+              "y": -60
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_7",
+              "text": "2\n9\n6\n0\n3\n8\n5\n1\n7\n4\n2\n9\n6\n0\n3\n8",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 198,
+              "y": -260
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_8",
+              "text": "7\n4\n0\n5\n8\n2\n6\n9\n1\n3\n7\n4\n0\n5\n8\n2",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 226,
+              "y": -120
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_9",
+              "text": "5\n1\n8\n4\n0\n7\n2\n3\n9\n6\n5\n1\n8\n4\n0\n7",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 254,
+              "y": -20
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_10",
+              "text": "3\n0\n6\n2\n9\n4\n1\n7\n5\n8\n3\n0\n6\n2\n9\n4",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 282,
+              "y": -200
+            }
+          },
+          {
+            "label": {
+              "id": "matrix_col_11",
+              "text": "8\n3\n1\n7\n2\n5\n0\n9\n4\n6\n8\n3\n1\n7\n2\n5",
+              "text_font": "font_small",
+              "text_color": 52309,
+              "x": 306,
+              "y": -100
+            }
+          },
+          {
+            "button": {
+              "id": "doorbell_full_screen_btn",
+              "x": 0,
+              "y": 0,
+              "width": "100%",
+              "height": "100%",
+              "radius": 0,
+              "bg_opa": "TRANSP",
+              "shadow_width": 0,
+              "border_width": 0,
+              "on_click": [
+                {
+                  "script.execute": "doorbell_press"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "doorbell_icon_btn",
+              "align": "CENTER",
+              "y": -16,
+              "width": 150,
+              "height": 150,
+              "radius": 75,
+              "bg_color": 15158332,
+              "shadow_width": 26,
+              "shadow_spread": 6,
+              "shadow_color": 15158332,
+              "shadow_opa": "51%",
+              "widgets": [
+                {
+                  "label": {
+                    "id": "doorbell_icon_label",
+                    "text": "",
+                    "align": "CENTER",
+                    "text_font": "montserrat_48",
+                    "text_color": 0,
+                    "text_opa": "35%"
+                  }
+                },
+                {
+                  "label": {
+                    "id": "doorbell_press_label",
+                    "text": "PRESS",
+                    "align": "CENTER",
+                    "y": -18,
+                    "text_font": "font_medium_bold",
+                    "text_color": 16777215
+                  }
+                },
+                {
+                  "label": {
+                    "id": "doorbell_enter_label",
+                    "text": "HERE",
+                    "align": "CENTER",
+                    "y": 14,
+                    "text_font": "font_medium_bold",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "script.execute": "doorbell_press"
+                }
+              ]
+            }
+          },
+          {
+            "obj": {
+              "id": "doorbell_caption_backing",
+              "align": "CENTER",
+              "y": 82,
+              "width": "90%",
+              "height": 34,
+              "radius": 8,
+              "bg_color": 0,
+              "bg_opa": "55%",
+              "border_width": 0
+            }
+          },
+          {
+            "label": {
+              "id": "doorbell_caption_label",
+              "text": "APT 666",
+              "text_font": "font_medium_bold",
+              "text_color": 16777215,
+              "text_align": "CENTER",
+              "align": "CENTER",
+              "width": "94%",
+              "y": 86
+            }
+          },
+          {
+            "label": {
+              "id": "doorbell_topleft_label",
+              "text": "DOOR BELL",
+              "text_font": "font_medium_bold",
+              "text_color": 16777215,
+              "align": "TOP_LEFT",
+              "x": 10,
+              "y": 8
+            }
+          },
+          {
+            "label": {
+              "id": "doorbell_topleft_bell_icon",
+              "text": "",
+              "text_font": "montserrat_24",
+              "text_color": 16777215,
+              "align": "TOP_LEFT",
+              "x": 145,
+              "y": 8
+            }
+          },
+          {
+            "label": {
+              "id": "doorbell_topleft_arrow",
+              "text": "",
+              "text_font": "montserrat_24",
+              "text_color": 16777215,
+              "align": "TOP_LEFT",
+              "x": 145,
+              "y": 40
+            }
+          },
+          {
+            "obj": {
+              "id": "availability_banner",
+              "align": "BOTTOM_MID",
+              "y": -6,
+              "width": "92%",
+              "height": 70,
+              "radius": 8,
+              "bg_color": 1195298,
+              "bg_opa": "92%",
+              "border_width": 2,
+              "border_color": 3066993,
+              "widgets": [
+                {
+                  "label": {
+                    "id": "availability_banner_label",
+                    "text": "We're here — ring the bell!",
+                    "text_font": "font_small",
+                    "text_color": 16777215,
+                    "text_align": "CENTER",
+                    "align": "CENTER",
+                    "width": "92%"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_btn",
+              "align": "TOP_RIGHT",
+              "x": -10,
+              "y": 8,
+              "width": 56,
+              "height": 56,
+              "radius": 28,
+              "bg_color": 16777215,
+              "bg_opa": "COVER",
+              "shadow_width": 0,
+              "widgets": [
+                {
+                  "label": {
+                    "id": "settings_icon_label",
+                    "text": "",
+                    "align": "CENTER",
+                    "text_font": "font_icon_lock_state",
+                    "text_color": 12042444
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "uint32_t now = millis();\nid(lock_icon_last_tap_is_double) = (now - id(lock_icon_last_tap_ms) < 350);\nid(lock_icon_last_tap_ms) = now;\nESP_LOGI(\"lock_icon\", \"tap: double=%s door_alarm_door.state=%s\",\n         id(lock_icon_last_tap_is_double) ? \"true\" : \"false\",\n         id(door_alarm_door).state ? \"true (open/unlocked)\" : \"false (closed/locked)\");"
+                },
+                {
+                  "if": {
+                    "condition": {
+                      "lambda": "return id(lock_icon_last_tap_is_double);"
+                    },
+                    "then": [
+                      {
+                        "script.stop": "lock_icon_single_tap_action"
+                      },
+                      {
+                        "globals.set": {
+                          "id": "lock_icon_last_tap_ms",
+                          "value": "0"
+                        }
+                      },
+                      {
+                        "globals.set": {
+                          "id": "pin_buffer",
+                          "value": "\"\""
+                        }
+                      },
+                      {
+                        "globals.set": {
+                          "id": "current_page",
+                          "value": "\"settings_pin\""
+                        }
+                      },
+                      {
+                        "lambda": "lv_label_set_text(id(settings_pin_display), \"\");"
+                      },
+                      {
+                        "lvgl.page.show": "settings_pin_page"
+                      }
+                    ],
+                    "else": [
+                      {
+                        "script.execute": "lock_icon_single_tap_action"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "call_return_btn",
+              "align": "TOP_RIGHT",
+              "x": -8,
+              "y": 72,
+              "width": 44,
+              "height": 44,
+              "radius": 22,
+              "bg_color": 16761095,
+              "border_width": 0,
+              "shadow_width": 20,
+              "shadow_spread": 4,
+              "shadow_ofs_x": 0,
+              "shadow_ofs_y": 0,
+              "shadow_color": 16766556,
+              "shadow_opa": "COVER",
+              "hidden": true,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "",
+                    "align": "CENTER",
+                    "text_font": "montserrat_18",
+                    "text_color": 2365184
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"incall\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "incall_page"
+                }
+              ]
+            }
+          },
+          {
+            "obj": {
+              "id": "doorbell_unavailable_overlay",
+              "x": 0,
+              "y": 0,
+              "width": "100%",
+              "height": "100%",
+              "radius": 0,
+              "bg_color": 0,
+              "bg_opa": "COVER",
+              "border_width": 0,
+              "pad_all": 20,
+              "hidden": true,
+              "widgets": [
+                {
+                  "label": {
+                    "id": "doorbell_unavailable_label",
+                    "text": "DOOR BELL\nUNAVAILABLE\nAT THIS TIME",
+                    "text_font": "font_medium_bold",
+                    "text_color": 15158332,
+                    "text_align": "CENTER",
+                    "align": "CENTER"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "obj": {
+              "id": "stolen_overlay",
+              "x": 0,
+              "y": 0,
+              "width": "100%",
+              "height": "100%",
+              "radius": 0,
+              "bg_color": 16777215,
+              "bg_opa": "COVER",
+              "border_width": 0,
+              "pad_all": 16,
+              "hidden": true,
+              "widgets": [
+                {
+                  "label": {
+                    "id": "stolen_overlay_label",
+                    "text": "HELP I BEEN STOLEN\nRETURN TO\nPO BOX 1357\nLINDSAY, CA 93247",
+                    "text_font": "font_medium_bold",
+                    "text_color": 16711680,
+                    "text_align": "CENTER",
+                    "align": "CENTER",
+                    "width": "92%",
+                    "long_mode": "WRAP"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "settings_pin_page",
+        "bg_color": 1119516,
+        "widgets": [
+          {
+            "label": {
+              "text": "Enter Settings PIN",
+              "text_font": "font_small",
+              "text_color": 12042444,
+              "align": "TOP_LEFT",
+              "x": 12,
+              "y": 10
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_cancel",
+              "align": "TOP_RIGHT",
+              "x": -10,
+              "y": 6,
+              "width": 32,
+              "height": 30,
+              "radius": 8,
+              "bg_color": 15158332,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "X",
+                    "align": "CENTER",
+                    "text_font": "font_small",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "pin_buffer",
+                    "value": "\"\""
+                  }
+                },
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"home\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "home_page"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "id": "settings_pin_display",
+              "text": "",
+              "text_font": "font_medium",
+              "text_color": 16777215,
+              "align": "TOP_MID",
+              "y": 30
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_1",
+              "x": 10,
+              "y": 50,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "1",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"1\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_2",
+              "x": 112,
+              "y": 50,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "2",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"2\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_3",
+              "x": 214,
+              "y": 50,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "3",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"3\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_4",
+              "x": 10,
+              "y": 90,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "4",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"4\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_5",
+              "x": 112,
+              "y": 90,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "5",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"5\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_6",
+              "x": 214,
+              "y": 90,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "6",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"6\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_7",
+              "x": 10,
+              "y": 130,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "7",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"7\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_8",
+              "x": 112,
+              "y": 130,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "8",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"8\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_9",
+              "x": 214,
+              "y": 130,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "9",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"9\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_clear",
+              "x": 10,
+              "y": 170,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15844367,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "CLEAR",
+                    "align": "CENTER",
+                    "text_font": "font_small",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "pin_buffer",
+                    "value": "\"\""
+                  }
+                },
+                {
+                  "lambda": "lv_label_set_text(id(settings_pin_display), \"\");"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_0",
+              "x": 112,
+              "y": 170,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 15592941,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "0",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(pin_buffer) += \"0\";\nlv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_pin_enter",
+              "x": 214,
+              "y": 170,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 3066993,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "ENTER",
+                    "align": "CENTER",
+                    "text_font": "font_small",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "if": {
+                    "condition": {
+                      "lambda": "return id(pin_buffer) == \"${settings_pin}\";"
+                    },
+                    "then": [
+                      {
+                        "globals.set": {
+                          "id": "pin_buffer",
+                          "value": "\"\""
+                        }
+                      },
+                      {
+                        "globals.set": {
+                          "id": "current_page",
+                          "value": "\"settings\""
+                        }
+                      },
+                      {
+                        "script.execute": "apply_dialpad_status"
+                      },
+                      {
+                        "lvgl.page.show": "settings_page"
+                      }
+                    ],
+                    "else": [
+                      {
+                        "if": {
+                          "condition": {
+                            "lambda": "return id(pin_buffer) == \"${door_pin}\";"
+                          },
+                          "then": [
+                            {
+                              "globals.set": {
+                                "id": "pin_buffer",
+                                "value": "\"\""
+                              }
+                            },
+                            {
+                              "lambda": "lv_label_set_text(id(settings_pin_display), \"\");"
+                            },
+                            {
+                              "if": {
+                                "condition": {
+                                  "api.connected": {}
+                                },
+                                "then": [
+                                  {
+                                    "homeassistant.service": {
+                                      "service": "script.turn_on",
+                                      "data": {
+                                        "entity_id": "${door_lock_script_entity}"
+                                      },
+                                      "on_error": [
+                                        {
+                                          "logger.log": {
+                                            "format": "HA service error (script.turn_on door lock via door_pin): %s",
+                                            "args": [
+                                              "error.c_str()"
+                                            ],
+                                            "tag": "ha_service"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ],
+                                "else": [
+                                  {
+                                    "logger.log": {
+                                      "format": "Skipped HA service call: no API connection",
+                                      "tag": "ha_service"
+                                    }
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "globals.set": {
+                                "id": "current_page",
+                                "value": "\"home\""
+                              }
+                            },
+                            {
+                              "lvgl.page.show": "home_page"
+                            }
+                          ],
+                          "else": [
+                            {
+                              "globals.set": {
+                                "id": "pin_buffer",
+                                "value": "\"\""
+                              }
+                            },
+                            {
+                              "lambda": "lv_label_set_text(id(settings_pin_display), \"Wrong PIN\");"
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "settings_page",
+        "bg_color": 1119516,
+        "widgets": [
+          {
+            "label": {
+              "text": "Settings",
+              "text_font": "font_medium",
+              "text_color": 16777215,
+              "align": "TOP_MID",
+              "y": 8
+            }
+          },
+          {
+            "button": {
+              "id": "settings_unlock_door_btn",
+              "x": 10,
+              "y": 36,
+              "width": 300,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "Unlock Door",
+                    "text_font": "font_medium",
+                    "text_color": 4029439,
+                    "align": "CENTER"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "if": {
+                    "condition": {
+                      "api.connected": {}
+                    },
+                    "then": [
+                      {
+                        "homeassistant.service": {
+                          "service": "script.turn_on",
+                          "data": {
+                            "entity_id": "${door_lock_script_entity}"
+                          },
+                          "on_error": [
+                            {
+                              "logger.log": {
+                                "format": "HA service error (script.turn_on door lock): %s",
+                                "args": [
+                                  "error.c_str()"
+                                ],
+                                "tag": "ha_service"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ],
+                    "else": [
+                      {
+                        "logger.log": {
+                          "format": "Skipped HA service call: no API connection",
+                          "tag": "ha_service"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_dialpad_btn",
+              "x": 10,
+              "y": 76,
+              "width": 300,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "id": "settings_dialpad_label",
+                    "text": "Dial Pad / Make Calls",
+                    "text_font": "font_medium",
+                    "text_color": 3066993,
+                    "align": "CENTER"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) = \"\";\nlv_label_set_text(id(dial_display), \"\");"
+                },
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"dialpad\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "dialpad_page"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_audio_mic_btn",
+              "x": 10,
+              "y": 116,
+              "width": 300,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "Audio / Mic Control",
+                    "text_font": "font_medium",
+                    "text_color": 12042444,
+                    "align": "CENTER"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"audio_mic\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "audio_mic_page"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_lcd_brightness_btn",
+              "x": 10,
+              "y": 156,
+              "width": 300,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "LCD Brightness",
+                    "text_font": "font_medium",
+                    "text_color": 15105570,
+                    "align": "CENTER"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"lcd_brightness\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "lcd_brightness_page"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "settings_homepage_exit_btn",
+              "x": 10,
+              "y": 196,
+              "width": 300,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "Homepage Exit",
+                    "text_font": "font_medium",
+                    "text_color": 15158332,
+                    "align": "CENTER"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"home\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "home_page"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "dialpad_page",
+        "bg_color": 15265013,
+        "widgets": [
+          {
+            "label": {
+              "id": "dial_display",
+              "text": "",
+              "text_font": "font_medium",
+              "text_color": 1119516,
+              "align": "TOP_MID",
+              "y": 2
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_1",
+              "x": 10,
+              "y": 28,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "1",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"1\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_2",
+              "x": 112,
+              "y": 28,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "2",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "ABC",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"2\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_3",
+              "x": 214,
+              "y": 28,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "3",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "DEF",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"3\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_4",
+              "x": 10,
+              "y": 68,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "4",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "GHI",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"4\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_5",
+              "x": 112,
+              "y": 68,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "5",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "JKL",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"5\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_6",
+              "x": 214,
+              "y": 68,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "6",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "MNO",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"6\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_7",
+              "x": 10,
+              "y": 108,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "7",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "PQRS",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"7\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_8",
+              "x": 112,
+              "y": 108,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "8",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "TUV",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"8\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_9",
+              "x": 214,
+              "y": 108,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "9",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "WXYZ",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"9\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_star",
+              "x": 10,
+              "y": 148,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "*",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"*\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_0",
+              "x": 112,
+              "y": 148,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "0",
+                    "align": "LEFT_MID",
+                    "x": 20,
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                },
+                {
+                  "label": {
+                    "text": "+",
+                    "align": "RIGHT_MID",
+                    "x": -14,
+                    "text_font": "font_small",
+                    "text_color": 8421504
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"0\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dial_btn_hash",
+              "x": 214,
+              "y": 148,
+              "width": 96,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 16777215,
+              "shadow_width": 4,
+              "shadow_color": 12174289,
+              "shadow_opa": "40%",
+              "widgets": [
+                {
+                  "label": {
+                    "text": "#",
+                    "align": "CENTER",
+                    "text_font": "font_medium",
+                    "text_color": 1119516
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) += \"#\";\nlv_label_set_text(id(dial_display), id(dial_buffer).c_str());"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dialpad_call_btn",
+              "x": 10,
+              "y": 192,
+              "width": 96,
+              "height": 40,
+              "radius": 20,
+              "bg_color": 3066993,
+              "shadow_width": 0,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "  CALL",
+                    "align": "CENTER",
+                    "text_font": "montserrat_18",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "if": {
+                    "condition": {
+                      "lambda": "return !id(dial_buffer).empty();"
+                    },
+                    "then": [
+                      {
+                        "globals.set": {
+                          "id": "call_is_outgoing",
+                          "value": "true"
+                        }
+                      },
+                      {
+                        "globals.set": {
+                          "id": "call_in_progress",
+                          "value": "true"
+                        }
+                      },
+                      {
+                        "globals.set": {
+                          "id": "call_seconds",
+                          "value": "0"
+                        }
+                      },
+                      {
+                        "lambda": "lv_label_set_text(id(incall_status_label), \"CALLING...\");\nlv_label_set_text(id(call_timer_label), \"00:00\");\nlv_label_set_text(id(answer_btn_label), \"CANCEL\");\nlv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);\nchar buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(incall_mic_gain_label), buf);"
+                      },
+                      {
+                        "globals.set": {
+                          "id": "current_page",
+                          "value": "\"incall\""
+                        }
+                      },
+                      {
+                        "lvgl.page.show": "incall_page"
+                      },
+                      {
+                        "sip_client.call": {
+                          "id": "phone",
+                          "number": "return id(dial_buffer);"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dialpad_end_btn",
+              "x": 112,
+              "y": 192,
+              "width": 96,
+              "height": 40,
+              "radius": 20,
+              "bg_color": 15158332,
+              "shadow_width": 0,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "  END",
+                    "align": "CENTER",
+                    "text_font": "montserrat_18",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "if": {
+                    "condition": {
+                      "lambda": "return id(call_active) || id(call_is_outgoing);"
+                    },
+                    "then": [
+                      {
+                        "sip_client.hangup": "phone"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "lambda": "id(dial_buffer) = \"\";\nlv_label_set_text(id(dial_display), \"\");"
+                },
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"settings\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "settings_page"
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "dialpad_homepage_btn",
+              "x": 214,
+              "y": 192,
+              "width": 96,
+              "height": 40,
+              "radius": 20,
+              "bg_color": 2041394,
+              "shadow_width": 0,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "  HOME",
+                    "align": "CENTER",
+                    "text_font": "montserrat_18",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "id(dial_buffer) = \"\";\nlv_label_set_text(id(dial_display), \"\");"
+                },
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"home\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "home_page"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "incall_page",
+        "bg_color": 0,
+        "widgets": [
+          {
+            "label": {
+              "text": "VOLUME:",
+              "text_font": "font_medium_bold",
+              "text_color": 16777215,
+              "x": 8,
+              "y": 14
+            }
+          },
+          {
+            "button": {
+              "id": "incall_speaker_down_btn",
+              "x": 165,
+              "y": 6,
+              "width": 34,
+              "height": 32,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "-",
+                    "align": "CENTER",
+                    "text_font": "font_large_bold",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "int v = id(volume_percent) - 5;\nif (v < 0) v = 0;\nid(volume_percent) = v;"
+                },
+                {
+                  "audio_dac.set_volume": {
+                    "id": "es8311_dac",
+                    "volume": "return id(volume_percent) / 100.0;"
+                  }
+                },
+                {
+                  "lambda": "char buf[8];\nsnprintf(buf, sizeof(buf), \"%d%%\", id(volume_percent));\nlv_label_set_text(id(incall_speaker_vol_label), buf);\nlv_label_set_text(id(volume_percent_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "id": "incall_speaker_vol_label",
+              "text": "85%",
+              "text_font": "font_small",
+              "text_color": 16777215,
+              "x": 206,
+              "y": 16
+            }
+          },
+          {
+            "button": {
+              "id": "incall_speaker_up_btn",
+              "x": 254,
+              "y": 6,
+              "width": 34,
+              "height": 32,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "+",
+                    "align": "CENTER",
+                    "text_font": "font_large_bold",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "int v = id(volume_percent) + 5;\nif (v > 100) v = 100;\nid(volume_percent) = v;"
+                },
+                {
+                  "audio_dac.set_volume": {
+                    "id": "es8311_dac",
+                    "volume": "return id(volume_percent) / 100.0;"
+                  }
+                },
+                {
+                  "lambda": "char buf[8];\nsnprintf(buf, sizeof(buf), \"%d%%\", id(volume_percent));\nlv_label_set_text(id(incall_speaker_vol_label), buf);\nlv_label_set_text(id(volume_percent_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "text": "MIC LEVEL:",
+              "text_font": "font_medium_bold",
+              "text_color": 16777215,
+              "x": 8,
+              "y": 56
+            }
+          },
+          {
+            "button": {
+              "id": "incall_mic_down_btn",
+              "x": 165,
+              "y": 48,
+              "width": 34,
+              "height": 32,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "-",
+                    "align": "CENTER",
+                    "text_font": "font_large_bold",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "float g = id(mic_gain_db) - 3.0;\nif (g < 0.0) g = 0.0;\nid(mic_gain_db) = g;"
+                },
+                {
+                  "audio_adc.set_mic_gain": {
+                    "id": "es7210_adc",
+                    "mic_gain": "return id(mic_gain_db);"
+                  }
+                },
+                {
+                  "lambda": "char buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(incall_mic_gain_label), buf);\nlv_label_set_text(id(mic_gain_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "id": "incall_mic_gain_label",
+              "text": "24.0dB",
+              "text_font": "font_small",
+              "text_color": 16777215,
+              "x": 206,
+              "y": 58
+            }
+          },
+          {
+            "button": {
+              "id": "incall_mic_up_btn",
+              "x": 254,
+              "y": 48,
+              "width": 34,
+              "height": 32,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "+",
+                    "align": "CENTER",
+                    "text_font": "font_large_bold",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "float g = id(mic_gain_db) + 3.0;\nif (g > 37.5) g = 37.5;\nid(mic_gain_db) = g;"
+                },
+                {
+                  "audio_adc.set_mic_gain": {
+                    "id": "es7210_adc",
+                    "mic_gain": "return id(mic_gain_db);"
+                  }
+                },
+                {
+                  "lambda": "char buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(incall_mic_gain_label), buf);\nlv_label_set_text(id(mic_gain_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "id": "call_timer_label",
+              "text": "00:00",
+              "text_font": "font_clock_bold",
+              "text_color": 16761095,
+              "align": "TOP_MID",
+              "y": 92
+            }
+          },
+          {
+            "label": {
+              "id": "incall_status_label",
+              "text": "RINGING...",
+              "text_font": "font_medium_bold",
+              "text_color": 16761095,
+              "align": "TOP_MID",
+              "y": 150
+            }
+          },
+          {
+            "button": {
+              "id": "answer_btn",
+              "x": 0,
+              "y": 196,
+              "width": 320,
+              "height": 44,
+              "radius": 0,
+              "bg_color": 3066993,
+              "widgets": [
+                {
+                  "label": {
+                    "id": "answer_btn_label",
+                    "text": "ANSWER",
+                    "align": "CENTER",
+                    "text_font": "font_medium_bold",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "if": {
+                    "condition": {
+                      "lambda": "return id(call_active) || id(call_is_outgoing);"
+                    },
+                    "then": [
+                      {
+                        "sip_client.hangup": "phone"
+                      }
+                    ],
+                    "else": [
+                      {
+                        "sip_client.answer": "phone"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "audio_mic_page",
+        "bg_color": 1119516,
+        "widgets": [
+          {
+            "button": {
+              "id": "back_from_audio_mic_btn",
+              "x": 8,
+              "y": 6,
+              "width": 32,
+              "height": 28,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "",
+                    "align": "CENTER",
+                    "text_font": "montserrat_18",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"settings\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "settings_page"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "text": "Audio / Mic Control",
+              "text_font": "font_small",
+              "text_color": 16777215,
+              "align": "TOP_MID",
+              "y": 12
+            }
+          },
+          {
+            "label": {
+              "text": "Auto-Answer",
+              "text_font": "font_small",
+              "text_color": 12042444,
+              "x": 14,
+              "y": 46
+            }
+          },
+          {
+            "switch": {
+              "id": "auto_answer_switch",
+              "x": 250,
+              "y": 42,
+              "on_click": [
+                {
+                  "switch.toggle": "voip_auto_answer"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "text": "Mute Speaker",
+              "text_font": "font_small",
+              "text_color": 12042444,
+              "x": 14,
+              "y": 78
+            }
+          },
+          {
+            "switch": {
+              "id": "mute_switch",
+              "x": 250,
+              "y": 74,
+              "on_click": [
+                {
+                  "switch.toggle": "speaker_mute"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "text": "Volume",
+              "text_font": "font_small",
+              "text_color": 12042444,
+              "x": 14,
+              "y": 110
+            }
+          },
+          {
+            "button": {
+              "id": "volume_down_btn",
+              "x": 14,
+              "y": 128,
+              "width": 50,
+              "height": 30,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "-",
+                    "align": "CENTER",
+                    "text_font": "font_medium"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "int v = id(volume_percent) - 5;\nif (v < 0) v = 0;\nid(volume_percent) = v;"
+                },
+                {
+                  "audio_dac.set_volume": {
+                    "id": "es8311_dac",
+                    "volume": "return id(volume_percent) / 100.0;"
+                  }
+                },
+                {
+                  "lambda": "char buf[8];\nsnprintf(buf, sizeof(buf), \"%d%%\", id(volume_percent));\nlv_label_set_text(id(volume_percent_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "id": "volume_percent_label",
+              "text": "70%",
+              "text_font": "font_medium",
+              "text_color": 16777215,
+              "align": "TOP_MID",
+              "x": 0,
+              "y": 132
+            }
+          },
+          {
+            "button": {
+              "id": "volume_up_btn",
+              "x": 256,
+              "y": 128,
+              "width": 50,
+              "height": 30,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "+",
+                    "align": "CENTER",
+                    "text_font": "font_medium"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "int v = id(volume_percent) + 5;\nif (v > 100) v = 100;\nid(volume_percent) = v;"
+                },
+                {
+                  "audio_dac.set_volume": {
+                    "id": "es8311_dac",
+                    "volume": "return id(volume_percent) / 100.0;"
+                  }
+                },
+                {
+                  "lambda": "char buf[8];\nsnprintf(buf, sizeof(buf), \"%d%%\", id(volume_percent));\nlv_label_set_text(id(volume_percent_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "text": "Mic Gain",
+              "text_font": "font_small",
+              "text_color": 12042444,
+              "x": 14,
+              "y": 168
+            }
+          },
+          {
+            "button": {
+              "id": "mic_gain_down_btn",
+              "x": 14,
+              "y": 186,
+              "width": 50,
+              "height": 30,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "-",
+                    "align": "CENTER",
+                    "text_font": "font_medium"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "float g = id(mic_gain_db) - 3.0;\nif (g < 0.0) g = 0.0;\nid(mic_gain_db) = g;"
+                },
+                {
+                  "audio_adc.set_mic_gain": {
+                    "id": "es7210_adc",
+                    "mic_gain": "return id(mic_gain_db);"
+                  }
+                },
+                {
+                  "lambda": "char buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(mic_gain_label), buf);\nlv_label_set_text(id(incall_mic_gain_label), buf);"
+                }
+              ]
+            }
+          },
+          {
+            "label": {
+              "id": "mic_gain_label",
+              "text": "24.0dB",
+              "text_font": "font_medium",
+              "text_color": 16777215,
+              "align": "TOP_MID",
+              "x": 0,
+              "y": 190
+            }
+          },
+          {
+            "button": {
+              "id": "mic_gain_up_btn",
+              "x": 256,
+              "y": 186,
+              "width": 50,
+              "height": 30,
+              "radius": 8,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "+",
+                    "align": "CENTER",
+                    "text_font": "font_medium"
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "lambda": "float g = id(mic_gain_db) + 3.0;\nif (g > 37.5) g = 37.5;\nid(mic_gain_db) = g;"
+                },
+                {
+                  "audio_adc.set_mic_gain": {
+                    "id": "es7210_adc",
+                    "mic_gain": "return id(mic_gain_db);"
+                  }
+                },
+                {
+                  "lambda": "char buf[12];\nsnprintf(buf, sizeof(buf), \"%.1fdB\", id(mic_gain_db));\nlv_label_set_text(id(mic_gain_label), buf);\nlv_label_set_text(id(incall_mic_gain_label), buf);"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "id": "lcd_brightness_page",
+        "bg_color": 1119516,
+        "widgets": [
+          {
+            "label": {
+              "text": "LCD Brightness",
+              "text_font": "font_medium",
+              "text_color": 16777215,
+              "align": "TOP_MID",
+              "y": 10
+            }
+          },
+          {
+            "slider": {
+              "id": "lcd_brightness_slider",
+              "x": 10,
+              "y": 100,
+              "width": 300,
+              "height": 16,
+              "min_value": 10,
+              "max_value": 100,
+              "value": 100,
+              "bg_color": 2041394,
+              "indicator": {
+                "bg_color": 15105570
+              },
+              "knob": {
+                "bg_color": 16777215
+              },
+              "on_release": [
+                {
+                  "light.turn_on": {
+                    "id": "led",
+                    "brightness": "return x / 100.0;"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "button": {
+              "id": "back_from_lcd_brightness_btn",
+              "align": "CENTER",
+              "y": 150,
+              "width": 150,
+              "height": 36,
+              "radius": 10,
+              "bg_color": 2041394,
+              "widgets": [
+                {
+                  "label": {
+                    "text": "Back",
+                    "align": "CENTER",
+                    "text_font": "font_small",
+                    "text_color": 16777215
+                  }
+                }
+              ],
+              "on_click": [
+                {
+                  "globals.set": {
+                    "id": "current_page",
+                    "value": "\"settings\""
+                  }
+                },
+                {
+                  "lvgl.page.show": "settings_page"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "text": [
+    {
+      "platform": "template",
+      "name": "Caption - Apt/Unit",
+      "id": "door_caption_message",
+      "icon": "mdi:card-text-outline",
+      "mode": "text",
+      "optimistic": true,
+      "restore_value": true,
+      "initial_value": "APT 666",
+      "max_length": 20,
+      "on_value": [
+        {
+          "lambda": "lv_label_set_text(id(doorbell_caption_label), id(door_caption_message).state.c_str());"
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "name": "Message - Available",
+      "id": "available_message",
+      "icon": "mdi:message-text",
+      "mode": "text",
+      "optimistic": true,
+      "restore_value": true,
+      "initial_value": "We're here — ring the bell!",
+      "max_length": 40,
+      "on_value": [
+        {
+          "script.execute": "apply_availability_status"
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "name": "Message - After Hours",
+      "id": "unavailable_message",
+      "icon": "mdi:message-text-outline",
+      "mode": "text",
+      "optimistic": true,
+      "restore_value": true,
+      "initial_value": "We're away right now. Please leave a message.",
+      "max_length": 60,
+      "on_value": [
+        {
+          "script.execute": "apply_availability_status"
+        }
+      ]
+    }
+  ],
+  "datetime": [
+    {
+      "platform": "template",
+      "type": "time",
+      "name": "Available From",
+      "id": "available_from",
+      "icon": "mdi:clock-start",
+      "optimistic": true,
+      "restore_value": true,
+      "initial_value": "09:00:00",
+      "on_value": [
+        {
+          "lambda": "ESP_LOGI(\"schedule\", \"Available From changed to %02d:%02d\", id(available_from).hour, id(available_from).minute);"
+        },
+        {
+          "script.execute": "apply_availability_status"
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "type": "time",
+      "name": "Available Until",
+      "id": "available_until",
+      "icon": "mdi:clock-end",
+      "optimistic": true,
+      "restore_value": true,
+      "initial_value": "22:00:00",
+      "on_value": [
+        {
+          "lambda": "ESP_LOGI(\"schedule\", \"Available Until changed to %02d:%02d\", id(available_until).hour, id(available_until).minute);"
+        },
+        {
+          "script.execute": "apply_availability_status"
+        }
+      ]
+    }
+  ],
+  "select": [
+    {
+      "platform": "template",
+      "name": "Screen Rotation",
+      "id": "screen_rotation_select",
+      "icon": "mdi:screen-rotation",
+      "entity_category": "CONFIG",
+      "optimistic": true,
+      "restore_value": true,
+      "initial_option": "0°",
+      "options": [
+        "0°",
+        "90°",
+        "180°",
+        "270°"
+      ],
+      "set_action": [
+        {
+          "script.execute": {
+            "id": "apply_screen_rotation",
+            "rotation": "if (x == \"90°\") return 90;\nif (x == \"180°\") return 180;\nif (x == \"270°\") return 270;\nreturn 0;"
+          }
+        }
+      ]
+    }
+  ],
+  "switch": [
+    {
+      "platform": "template",
+      "name": "Speaker Mute",
+      "id": "speaker_mute",
+      "optimistic": true,
+      "restore_mode": "RESTORE_DEFAULT_OFF",
+      "turn_on_action": [
+        {
+          "audio_dac.mute_on": "es8311_dac"
+        },
+        {
+          "lvgl.widget.update": {
+            "id": "mute_switch",
+            "state": {
+              "checked": true
+            }
+          }
+        }
+      ],
+      "turn_off_action": [
+        {
+          "audio_dac.mute_off": "es8311_dac"
+        },
+        {
+          "lvgl.widget.update": {
+            "id": "mute_switch",
+            "state": {
+              "checked": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "name": "Do Not Disturb",
+      "id": "dnd_switch",
+      "icon": "mdi:bell-cancel-outline",
+      "optimistic": true,
+      "restore_mode": "RESTORE_DEFAULT_OFF",
+      "turn_on_action": [
+        {
+          "globals.set": {
+            "id": "dnd_enabled",
+            "value": "true"
+          }
+        },
+        {
+          "lambda": "lv_obj_add_flag(id(doorbell_icon_btn), LV_OBJ_FLAG_HIDDEN);"
+        }
+      ],
+      "turn_off_action": [
+        {
+          "globals.set": {
+            "id": "dnd_enabled",
+            "value": "false"
+          }
+        },
+        {
+          "lambda": "lv_obj_clear_flag(id(doorbell_icon_btn), LV_OBJ_FLAG_HIDDEN);"
+        }
+      ]
+    },
+    {
+      "platform": "template",
+      "name": "Intercom Auto Answer",
+      "id": "voip_auto_answer",
+      "optimistic": true,
+      "restore_mode": "RESTORE_DEFAULT_OFF",
+      "turn_on_action": [
+        {
+          "globals.set": {
+            "id": "auto_answer_enabled",
+            "value": "true"
+          }
+        },
+        {
+          "lvgl.widget.update": {
+            "id": "auto_answer_switch",
+            "state": {
+              "checked": true
+            }
+          }
+        }
+      ],
+      "turn_off_action": [
+        {
+          "globals.set": {
+            "id": "auto_answer_enabled",
+            "value": "false"
+          }
+        },
+        {
+          "lvgl.widget.update": {
+            "id": "auto_answer_switch",
+            "state": {
+              "checked": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "platform": "gpio",
+      "id": "speaker_enable",
+      "pin": {
+        "number": "GPIO46",
+        "ignore_strapping_warning": true
+      },
+      "restore_mode": "ALWAYS_ON"
+    }
+  ]
+}
