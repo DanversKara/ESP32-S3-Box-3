@@ -274,9 +274,13 @@ interval:
               lv_obj_set_style_shadow_spread(id(doorbell_icon_btn), 6, 0);
               lv_obj_set_style_shadow_opa(id(doorbell_icon_btn), 130 + (rnd % 100), 0);
   # Green digital-rain background for the home page - 12 tall columns of
-  # random digits scroll downward and wrap back to the top, with each
-  # column's digits reshuffled every so often for a flickering effect.
-  # Only runs while the home page is showing, to save CPU elsewhere.
+  # random katakana/digit glyphs scroll vertically and wrap around, with
+  # each column's characters reshuffled every so often for a flickering
+  # effect. Even-indexed columns (0,2,4...) fall downward; odd-indexed
+  # columns (1,3,5...) rise upward, so adjacent columns move in opposite
+  # directions - this is what makes it read as "confusing" rain rather
+  # than one uniform sheet sliding down. Only runs while the home page is
+  # showing, to save CPU elsewhere.
   - interval: 180ms
     then:
       if:
@@ -293,15 +297,34 @@ interval:
               static int16_t col_y[12] = { -260, -40, -180, -300, -10, -220,
                                             -60, -260, -120, -20, -200, -100 };
               static uint8_t tick = 0;
+              // Katakana + digits - the actual glyph set classic "Matrix
+              // code" rain uses. Must exactly match font_matrix's
+              // "glyphs" list above, or LVGL has nothing to draw.
+              static const char* pool[] = {
+                "0","1","2","3","4","5","6","7","8","9",
+                "ア","イ","ウ","エ","オ","カ","キ","ク","ケ","コ",
+                "サ","シ","ス","セ","ソ","タ","チ","ツ","テ","ト",
+                "ナ","ニ","ヌ","ネ","ノ","ハ","ヒ","フ","ヘ","ホ",
+                "マ","ミ","ム","メ","モ","ヤ","ユ","ヨ","ラ","リ",
+                "ル","レ","ロ","ワ","ヲ","ン"
+              };
+              static const int pool_size = sizeof(pool) / sizeof(pool[0]);
               tick++;
               for (int i = 0; i < 12; i++) {
-                col_y[i] += 6;
-                if (col_y[i] > 260) col_y[i] = -280;
+                if (i % 2 == 0) {
+                  // falls
+                  col_y[i] += 6;
+                  if (col_y[i] > 260) col_y[i] = -280;
+                } else {
+                  // rises
+                  col_y[i] -= 6;
+                  if (col_y[i] < -280) col_y[i] = 260;
+                }
                 lv_obj_set_y(cols[i], col_y[i]);
                 if (((tick + i) % 14) == 0) {
                   std::string s;
                   for (int r = 0; r < 16; r++) {
-                    s += std::to_string(random_uint32() % 10);
+                    s += pool[random_uint32() % pool_size];
                     if (r != 15) s += "\n";
                   }
                   lv_label_set_text(cols[i], s.c_str());
@@ -1154,6 +1177,15 @@ font:
   - file: "gfonts://Roboto"
     id: font_small
     size: 16
+  #── Digital-rain background font ─────────────────────────────────────────
+  # Katakana + digits, matching the actual glyph set classic "Matrix code"
+  # rain uses, instead of plain 0-9. Glyphs are hand-listed because ESPHome
+  # only embeds characters explicitly declared here (whatever the lambda
+  # below picks at random has to already exist in this list).
+  - file: "gfonts://Noto+Sans+JP"
+    id: font_matrix
+    size: 16
+    glyphs: "0123456789アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン"
   - file: "gfonts://Roboto"
     id: font_clock
     size: 48
@@ -1408,91 +1440,92 @@ lvgl:
     - id: home_page
       bg_color: 0x000000
       widgets:
-        # Matrix-style falling-numbers background - 12 columns of random
-        # digits, animated by the "Green digital-rain" interval above.
-        # Non-clickable, so taps still fall through to the doorbell
-        # button beneath/around them.
+        # Matrix-style digital-rain background - 12 columns of random
+        # katakana/digit glyphs, animated by the "Green digital-rain"
+        # interval above. Even columns fall, odd columns rise (set there,
+        # not here). Non-clickable, so taps still fall through to the
+        # doorbell button beneath/around them.
         - label:
             id: matrix_col_0
-            text: "3\n7\n1\n9\n4\n0\n8\n2\n6\n5\n1\n7\n3\n9\n0\n6"
-            text_font: font_small
+            text: "3\nア\n1\nキ\n4\n0\nタ\n2\nネ\n5\n1\nヲ\n3\nン\n0\nミ"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 2
             y: -260
         - label:
             id: matrix_col_1
-            text: "8\n2\n5\n0\n7\n1\n4\n9\n3\n6\n2\n8\n5\n0\n1\n4"
-            text_font: font_small
+            text: "8\nカ\n5\nソ\n7\nナ\n4\nユ\n3\nロ\n2\nチ\n5\nエ\nリ\n4"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 30
             y: -40
         - label:
             id: matrix_col_2
-            text: "1\n6\n9\n3\n0\n5\n8\n2\n4\n7\n1\n6\n9\n3\n0\n5"
-            text_font: font_small
+            text: "1\nコ\n9\nハ\n0\nメ\nク\n2\nラ\n7\n1\nフ\n9\nセ\n0\nイ"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 58
             y: -180
         - label:
             id: matrix_col_3
-            text: "4\n0\n7\n2\n9\n6\n1\n8\n5\n3\n4\n0\n7\n2\n9\n6"
-            text_font: font_small
+            text: "4\nヨ\n7\nシ\n9\nモ\n1\nテ\n5\nウ\n4\nマ\n7\nト\n9\nレ"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 86
             y: -300
         - label:
             id: matrix_col_4
-            text: "9\n5\n2\n8\n1\n4\n0\n6\n3\n7\n9\n5\n2\n8\n1\n4"
-            text_font: font_small
+            text: "9\nホ\n2\nヌ\n1\nヨ\n0\nサ\n3\nズ\n9\nオ\n2\nチ\n8\nワ"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 114
             y: -10
         - label:
             id: matrix_col_5
-            text: "0\n8\n4\n1\n6\n3\n9\n5\n2\n7\n0\n8\n4\n1\n6\n3"
-            text_font: font_small
+            text: "0\nツ\n4\nコ\n6\nナ\n9\nリ\n2\n7\nミ\n8\nエ\n1\nヒ\n3"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 142
             y: -220
         - label:
             id: matrix_col_6
-            text: "6\n1\n3\n9\n5\n0\n7\n4\n8\n2\n6\n1\n3\n9\n5\n0"
-            text_font: font_small
+            text: "6\nロ\n3\nウ\n5\nソ\n7\nカ\n8\n2\nセ\n1\nテ\n9\nネ\n0"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 170
             y: -60
         - label:
             id: matrix_col_7
-            text: "2\n9\n6\n0\n3\n8\n5\n1\n7\n4\n2\n9\n6\n0\n3\n8"
-            text_font: font_small
+            text: "2\nマ\n6\nフ\n3\nヲ\n5\nキ\n7\n4\nチ\n9\nユ\n0\nイ\n8"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 198
             y: -260
         - label:
             id: matrix_col_8
-            text: "7\n4\n0\n5\n8\n2\n6\n9\n1\n3\n7\n4\n0\n5\n8\n2"
-            text_font: font_small
+            text: "7\nシ\n0\nメ\n8\nタ\n6\nラ\n1\n3\nホ\n4\nオ\n5\nミ\n2"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 226
             y: -120
         - label:
             id: matrix_col_9
-            text: "5\n1\n8\n4\n0\n7\n2\n3\n9\n6\n5\n1\n8\n4\n0\n7"
-            text_font: font_small
+            text: "5\nト\n8\nエ\n0\nコ\n2\nヌ\n9\n6\nレ\n1\nサ\n4\nウ\n7"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 254
             y: -20
         - label:
             id: matrix_col_10
-            text: "3\n0\n6\n2\n9\n4\n1\n7\n5\n8\n3\n0\n6\n2\n9\n4"
-            text_font: font_small
+            text: "3\nリ\n6\nハ\n9\nヨ\n1\nカ\n5\n8\nチ\n0\nソ\n2\nネ\n4"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 282
             y: -200
         - label:
             id: matrix_col_11
-            text: "8\n3\n1\n7\n2\n5\n0\n9\n4\n6\n8\n3\n1\n7\n2\n5"
-            text_font: font_small
+            text: "8\nナ\n1\nセ\n2\nロ\n0\nミ\n4\n6\nイ\n3\nフ\n7\nウ\n5"
+            text_font: font_matrix
             text_color: 0x00CC55
             x: 306
             y: -100
