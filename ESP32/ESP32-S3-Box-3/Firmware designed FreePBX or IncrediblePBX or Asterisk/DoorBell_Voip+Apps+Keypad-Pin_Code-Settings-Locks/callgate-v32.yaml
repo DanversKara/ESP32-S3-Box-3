@@ -927,7 +927,9 @@ script:
   #                              banner height -> 35px
   #   - Available Until hits -> DND turns ON,
   #                              banner height -> 290px (covers the
-  #                              button fully - see banner_height_num)
+  #                              button fully - see banner_height_num),
+  #                              banner width  -> 95%   (see
+  #                              banner_width_num)
   # Manually toggling DND or the banner height mid-window (e.g. from
   # HA) is left alone until the next scheduled crossing.
   # ------------------------------------------------------------------
@@ -965,6 +967,7 @@ script:
               // Just crossed Available Until.
               id(dnd_switch).turn_on();
               id(banner_height_num).make_call().set_value(290).perform();
+              id(banner_width_num).make_call().set_value(95).perform();
             }
           }
           id(schedule_was_available) = available;
