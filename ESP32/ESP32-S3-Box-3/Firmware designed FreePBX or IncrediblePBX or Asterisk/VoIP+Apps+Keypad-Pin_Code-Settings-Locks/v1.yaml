@@ -1,0 +1,3566 @@
+substitutions:
+  name: esp32-s3box-3
+  friendly_name: ESP32-S3-Box-3
+  friendly_name2: PLEASE WAIT
+  external_media_player: living_room_speaker
+  home_assistant_host: http://192.168.8.162:8123
+  api_key: !secret api_key
+  wifi_fallback_pwd: s3box123
+  voip_test_account_extension: !secret voip_test_account_extension
+  voip_test_account_password: !secret voip_test_account_password
+  ha_location_name: "Home Assistant"
+  settings_pin: !secret settings_pin
+  door_pin: !secret door_pin
+  #── Lights & IR entities — fill these in with your real entity IDs ────────
+  light_widget_entity: light.living_room_living_room_light       # your color/dimmable light entity
+  menu_fan_entity: fan.living_room_fan          # your IR fan switch entity
+  menu_tv_entity: switch.living_room_tv_ir           # your IR TV switch entity
+  menu_soundbar_entity: switch.living_room_soundbar     # your IR soundbar switch entity
+
+external_components:
+  - source: github://eigger/espcomponents
+    components: [ sip_client ]
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2024.8.0
+  project:
+    name: "kara_danvers.esp32-s3box-3"
+    version: "1.0.0"
+  on_boot:
+    priority: 600
+    then:
+      - audio_dac.mute_off: es8311_dac
+      - audio_dac.set_volume:
+          id: es8311_dac
+          volume: 85%
+      - audio_adc.set_mic_gain:
+          id: es7210_adc
+          mic_gain: !lambda 'return id(mic_gain_db);'
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+    advanced:
+      execute_from_psram: true
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+  fast_connect: true
+  ap:
+    ssid: ${name}
+    password: ${wifi_fallback_pwd}
+  on_connect:
+    - delay: 2s
+    - audio_dac.set_volume:
+        id: es8311_dac
+        volume: 85%
+    - audio_dac.mute_off: es8311_dac
+    - globals.set:
+        id: wifi_connected
+        value: 'true'
+    - lambda: |-
+        lv_label_set_text(id(wifi_status_icon), "\uF1EB");
+        lv_obj_set_style_text_color(id(wifi_status_icon), lv_color_hex(0x2ECC71), 0);
+    - script.execute: update_status_icons
+  on_disconnect:
+    - globals.set:
+        id: wifi_connected
+        value: 'false'
+    # Wi-Fi dropping also breaks the SIP registration (it doesn't survive a
+    # link loss), so treat it as lost until the client registers again.
+    - globals.set:
+        id: sip_registered
+        value: 'false'
+    - lambda: |-
+        lv_label_set_text(id(wifi_status_icon), "\uF1EB");
+        lv_obj_set_style_text_color(id(wifi_status_icon), lv_color_hex(0xE74C3C), 0);
+    - script.execute: update_status_icons
+
+captive_portal:
+
+api:
+  encryption:
+    key: ${api_key}
+  on_client_connected:
+    then:
+      - lambda: |-
+          lv_label_set_text(id(ha_status_icon), "\uF015");
+          lv_obj_set_style_text_color(id(ha_status_icon), lv_color_hex(0x2ECC71), 0);
+      - if:
+          condition:
+            lambda: 'return !id(boot_complete);'
+          then:
+            - globals.set:
+                id: boot_complete
+                value: 'true'
+            - lambda: |-
+                lv_label_set_text(id(boot_status_label), "Connected!");
+            - lambda: |-
+                char buf[8];
+                snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                lv_label_set_text(id(volume_percent_label), buf);
+            - lambda: |-
+                char buf[12];
+                snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                lv_label_set_text(id(mic_gain_label), buf);
+                lv_label_set_text(id(incall_mic_gain_label), buf);
+            - script.execute: update_status_icons
+            - delay: 400ms
+            - globals.set:
+                id: current_page
+                value: '"home"'
+            - lvgl.page.show: home_page
+  on_client_disconnected:
+    then:
+      - lambda: |-
+          lv_label_set_text(id(ha_status_icon), "\uF015");
+          lv_obj_set_style_text_color(id(ha_status_icon), lv_color_hex(0xE74C3C), 0);
+
+ota:
+  platform: esphome
+
+time:
+  platform: sntp
+  id: sntp_time
+
+interval:
+  - interval: 1s
+    then:
+      lambda: |-
+        auto t = id(sntp_time).now();
+        if (t.is_valid()) {
+          std::string ts = t.strftime("%I:%M:%S %p");
+          if (ts.size() > 0 && ts[0] == '0') ts.erase(0, 1);
+          lv_label_set_text(id(clock_label), ts.c_str());
+          std::string ds = t.strftime("%A, %B %d");
+          lv_label_set_text(id(date_label), ds.c_str());
+        }
+  - interval: 30ms
+    then:
+      if:
+        condition:
+          lambda: 'return !id(boot_complete);'
+        then:
+          - lambda: |-
+              static int angle = 0;
+              angle = (angle + 6) % 360;
+              lv_arc_set_rotation(id(boot_spinner_arc), angle);
+  - interval: 450ms
+    then:
+      if:
+        condition:
+          lambda: 'return !id(boot_complete);'
+        then:
+          - lambda: |-
+              id(boot_dot_count) = (id(boot_dot_count) + 1) % 4;
+              std::string dots(id(boot_dot_count), '.');
+              std::string txt = "BOOTING" + dots;
+              lv_label_set_text(id(boot_status_label), txt.c_str());
+  - interval: 1s
+    then:
+      if:
+        condition:
+          lambda: 'return id(call_active);'
+        then:
+          - lambda: |-
+              id(call_seconds) += 1;
+              int m = id(call_seconds) / 60;
+              int s = id(call_seconds) % 60;
+              char buf[10];
+              snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+              lv_label_set_text(id(call_timer_label), buf);
+  - interval: 500ms
+    then:
+      if:
+        condition:
+          lambda: 'return id(call_in_progress);'
+        then:
+          - lambda: |-
+              // Pulsing amber "return to call" badge - the bg_color and
+              // shadow both breathe between a bright and dim amber so the
+              // glow looks like it's coming from behind the icon rather
+              // than just a flat blink.
+              lv_obj_clear_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);
+              id(call_return_blink) = !id(call_return_blink);
+              if (id(call_return_blink)) {
+                lv_obj_set_style_bg_color(id(call_return_btn), lv_color_hex(0xFFC107), 0);
+                lv_obj_set_style_shadow_color(id(call_return_btn), lv_color_hex(0xFFD65C), 0);
+                lv_obj_set_style_shadow_width(id(call_return_btn), 26, 0);
+                lv_obj_set_style_shadow_spread(id(call_return_btn), 6, 0);
+                lv_obj_set_style_shadow_opa(id(call_return_btn), 255, 0);
+              } else {
+                lv_obj_set_style_bg_color(id(call_return_btn), lv_color_hex(0xC9860A), 0);
+                lv_obj_set_style_shadow_color(id(call_return_btn), lv_color_hex(0xFFC107), 0);
+                lv_obj_set_style_shadow_width(id(call_return_btn), 12, 0);
+                lv_obj_set_style_shadow_spread(id(call_return_btn), 1, 0);
+                lv_obj_set_style_shadow_opa(id(call_return_btn), 140, 0);
+              }
+        else:
+          - lambda: |-
+              lv_obj_add_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);
+
+esp32_ble_tracker:
+
+bluetooth_proxy:
+  active: true
+
+i2c:
+  - id: bus_a
+    sda: GPIO08
+    scl: GPIO18
+    scan: true
+    frequency: 100kHz
+  - id: bus_b
+    sda: GPIO41
+    scl: GPIO40
+    scan: true
+    frequency: 100kHz
+
+output:
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    id: led
+    name: "LCD Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+sensor:
+  - platform: adc
+    pin: GPIO10
+    id: battery_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: "voltage"
+    entity_category: "diagnostic"
+    update_interval: 30s
+    attenuation: auto
+    filters:
+      - multiply: 4.11
+  - platform: copy
+    id: battery_percent
+    source_id: battery_voltage
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: "battery"
+    entity_category: "diagnostic"
+    filters:
+      - lambda: return (x - 2.7) / (4.2 - 2.7) * 100;
+      - clamp:
+          min_value: 0
+          max_value: 100
+    on_value:
+      lambda: |-
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%.0f", x);
+        lv_label_set_text(id(battery_status_label), buf);
+        const char *icon;
+        uint32_t color;
+        if (x >= 60) {
+          icon = "\uF240";               // battery full (100-60)
+          color = 0x2ECC71;              // green
+        } else if (x >= 30) {
+          icon = "\uF241";               // battery 3/4 (59-30)
+          color = 0xE67E22;              // orange
+        } else if (x >= 16) {
+          icon = "\uF242";               // battery 1/2 (29-16)
+          color = 0xF1C40F;              // yellow
+        } else {
+          icon = "\uF244";               // battery empty (15-1)
+          color = 0xE74C3C;              // red
+        }
+        lv_label_set_text(id(battery_icon_label), icon);
+        lv_obj_set_style_text_color(id(battery_icon_label), lv_color_hex(color), 0);
+
+  #── LIV LITE light state mirrors (ported from old.yaml) ──────────────────
+  # Keeps the Lights page sliders in sync with the real ${light_widget_entity}
+  # state in HA, instead of only ever sending commands one-way.
+  - platform: homeassistant
+    id: liv_light_brightness
+    entity_id: ${light_widget_entity}
+    attribute: brightness
+    internal: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return !std::isnan(x) &&
+                !(lv_indev_get_act() != nullptr &&
+                lv_indev_get_active_obj() == id(light_brightness_slider));
+            then:
+              - lvgl.slider.update:
+                  id: light_brightness_slider
+                  value: !lambda 'return (int)(x / 255.0 * 100.0);'
+  - platform: homeassistant
+    id: liv_light_color_temp
+    entity_id: ${light_widget_entity}
+    attribute: color_temp_kelvin
+    internal: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return !std::isnan(x) &&
+                !(lv_indev_get_act() != nullptr &&
+                lv_indev_get_active_obj() == id(light_temp_slider));
+            then:
+              - lvgl.slider.update:
+                  id: light_temp_slider
+                  value: !lambda 'return (int)x;'
+
+i2s_audio:
+  - id: mic_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO17
+      allow_other_uses: true
+    i2s_mclk_pin:
+      number: GPIO2
+      allow_other_uses: true
+  - id: speaker_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO17
+      allow_other_uses: true
+    i2s_mclk_pin:
+      number: GPIO2
+      allow_other_uses: true
+
+audio_adc:
+  platform: es7210
+  id: es7210_adc
+  i2c_id: bus_a
+  bits_per_sample: 16bit
+  sample_rate: 16000
+
+audio_dac:
+  platform: es8311
+  id: es8311_dac
+  i2c_id: bus_a
+  bits_per_sample: 16bit
+  sample_rate: 16000
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    i2s_audio_id: mic_bus
+    i2s_mode: secondary  # mic slaves to the speaker's clock instead of being the master
+    sample_rate: 16000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    channel: right
+    adc_type: external
+
+speaker:
+  - id: i2s_audio_speaker
+    platform: i2s_audio
+    i2s_audio_id: speaker_bus
+    i2s_mode: primary  # speaker is now the I2S clock master, drives BCLK/LRCLK/MCLK continuously
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+    audio_dac: es8311_dac
+    buffer_duration: 100ms
+  - platform: resampler
+    id: voip_speaker
+    output_speaker: i2s_audio_speaker
+    sample_rate: 16000
+
+rtttl:
+  - id: ringtone
+    speaker: i2s_audio_speaker
+    gain: 0.6
+    on_finished_playback:
+      - logger.log: "rtttl: finished playback callback fired"
+      - delay: 800ms
+      - if:
+          condition:
+            lambda: 'return id(current_page) == "incall" && !id(call_active);'
+          then:
+            - logger.log: "rtttl: still ringing, replaying"
+            - rtttl.play:
+                id: ringtone
+                rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+
+button:
+  - platform: template
+    name: "Test Ringtone"
+    entity_category: diagnostic
+    on_press:
+      - logger.log: "rtttl: manual test triggered"
+      - rtttl.play:
+          id: ringtone
+          rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+
+script:
+  # Single place that redraws the three status icons in the top-left group
+  # (phone connector, mic-in-use, auto-answer) from current global state.
+  # Called from every place that changes one of those globals instead of
+  # duplicating the lambda everywhere.
+  - id: update_status_icons
+    then:
+      - lambda: |-
+          // --- Phone connector icon ---
+          // Busy: a call is ringing, dialing, or connected - shown as an
+          // amber "line through the phone" (close/X) glyph instead of the
+          // handset, same amber used elsewhere in the UI for "call in
+          // progress". Otherwise it's the handset glyph, colored green if
+          // Wi-Fi is up AND the SIP client has registered, red if either
+          // is down.
+          if (id(call_in_progress)) {
+            lv_label_set_text(id(phone_icon_label), "\uF00D");
+            lv_obj_set_style_text_color(id(phone_icon_label), lv_color_hex(0xFFC107), 0);
+          } else if (id(wifi_connected) && id(sip_registered)) {
+            lv_label_set_text(id(phone_icon_label), "\uF095");
+            lv_obj_set_style_text_color(id(phone_icon_label), lv_color_hex(0x2ECC71), 0);
+          } else {
+            lv_label_set_text(id(phone_icon_label), "\uF095");
+            lv_obj_set_style_text_color(id(phone_icon_label), lv_color_hex(0xE74C3C), 0);
+          }
+          // --- Mic-in-use icon ---
+          // Red while a call is actually connected (mic audio is being
+          // sent to the far end), green the rest of the time.
+          if (id(call_active)) {
+            lv_obj_set_style_text_color(id(mic_status_icon), lv_color_hex(0xE74C3C), 0);
+          } else {
+            lv_obj_set_style_text_color(id(mic_status_icon), lv_color_hex(0x2ECC71), 0);
+          }
+          // --- Auto-answer icon ---
+          // Green: auto-answer is off.
+          // Red: auto-answer is on AND a call is live right now (mic in
+          // use + connection live).
+          // Orange: auto-answer is on but armed/idle - no call right now.
+          if (!id(auto_answer_enabled)) {
+            lv_obj_set_style_text_color(id(auto_answer_status_icon), lv_color_hex(0x2ECC71), 0);
+          } else if (id(call_active)) {
+            lv_obj_set_style_text_color(id(auto_answer_status_icon), lv_color_hex(0xE74C3C), 0);
+          } else {
+            lv_obj_set_style_text_color(id(auto_answer_status_icon), lv_color_hex(0xFFA500), 0);
+          }
+
+sip_client:
+  id: phone
+  server: "192.168.8.220"
+  username: ${voip_test_account_extension}
+  password: ${voip_test_account_password}
+  microphone: box_mic
+  speaker: voip_speaker
+  channel: mono
+  on_registered:
+    - logger.log: "SIP: registered with server"
+    - globals.set:
+        id: sip_registered
+        value: 'true'
+    - script.execute: update_status_icons
+  on_incoming_call:
+    - logger.log:
+        format: "Incoming call from %s"
+        args: ['caller.c_str()']
+    - globals.set:
+        id: current_page
+        value: '"incall"'
+    - globals.set:
+        id: call_seconds
+        value: '0'
+    - globals.set:
+        id: call_in_progress
+        value: 'true'
+    - globals.set:
+        id: call_is_outgoing
+        value: 'false'
+    - lambda: |-
+        lv_label_set_text(id(incall_status_label), "RINGING...");
+        std::string caller_txt = "Caller: " + (caller.empty() ? std::string("Unknown Caller") : caller);
+        lv_label_set_text(id(caller_id_label), caller_txt.c_str());
+        lv_label_set_text(id(call_timer_label), "00:00");
+        lv_label_set_text(id(answer_btn_label), "ANSWER");
+        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0x2ECC71), 0);
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+        lv_label_set_text(id(incall_mic_gain_label), buf);
+    - script.execute: update_status_icons
+    - lvgl.page.show: incall_page
+    - light.turn_on:
+        id: led
+        flash_length: 500ms
+    - if:
+        condition:
+          lambda: 'return id(auto_answer_enabled);'
+        then:
+          - sip_client.answer: phone
+        else:
+          - logger.log: "rtttl: playing ring for incoming call"
+          - rtttl.play:
+              id: ringtone
+              rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+  on_call_connected:
+    - rtttl.stop:
+        id: ringtone
+    - globals.set:
+        id: call_active
+        value: 'true'
+    - globals.set:
+        id: call_is_outgoing
+        value: 'false'
+    - lambda: |-
+        lv_label_set_text(id(incall_status_label), "CONNECTED");
+        lv_label_set_text(id(answer_btn_label), "END CALL");
+        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+    - script.execute: update_status_icons
+  on_call_ended:
+    - rtttl.stop:
+        id: ringtone
+    - globals.set:
+        id: call_active
+        value: 'false'
+    - globals.set:
+        id: call_in_progress
+        value: 'false'
+    - globals.set:
+        id: call_is_outgoing
+        value: 'false'
+    - globals.set:
+        id: current_page
+        value: '"home"'
+    - globals.set:
+        id: call_seconds
+        value: '0'
+    - lambda: |-
+        id(dial_buffer) = "";
+        lv_label_set_text(id(call_timer_label), "00:00");
+        lv_label_set_text(id(answer_btn_label), "ANSWER");
+        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0x2ECC71), 0);
+        // Whatever mic level the caller landed on mid-call is now saved as
+        // the standing setting (mic_gain_db has restore_value: true, so it
+        // survives reboots) - just make sure the Settings page reflects it.
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+        lv_label_set_text(id(mic_gain_label), buf);
+    - script.execute: update_status_icons
+    - lvgl.page.show: home_page
+
+text_sensor:
+  - platform: homeassistant
+    id: front_door_lock_state
+    entity_id: lock.living_room_front_door_lock
+    internal: true
+  # TV IR switch mirror — uses a text_sensor instead of homeassistant.switch
+  # because that entity can briefly report "unknown"/"unavailable" (it's an
+  # IR-blaster switch with no real feedback), and the homeassistant.switch
+  # platform logs a warning for any state that isn't literally on/off. This
+  # reads the raw string and treats anything other than "on" as off.
+  - platform: homeassistant
+    id: tv_ir_state
+    entity_id: ${menu_tv_entity}
+    internal: true
+    on_value:
+      if:
+        condition:
+          lambda: 'return x == "on";'
+        then:
+          - lambda: |-
+              lv_obj_set_style_bg_color(id(tv_ir_btn), lv_color_hex(0x3D7BFF), 0);
+        else:
+          - lambda: |-
+              lv_obj_set_style_bg_color(id(tv_ir_btn), lv_color_hex(0x1F2632), 0);
+
+binary_sensor:
+  - platform: homeassistant
+    id: door_alarm
+    entity_id: binary_sensor.door_alarm_door
+    on_state:
+      if:
+        condition:
+          binary_sensor.is_on: door_alarm
+        then:
+          - lambda: |-
+              lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0xe02e1c), 0);
+              lv_label_set_text(id(lock_badge_label), "OPEN");
+        else:
+          - lambda: |-
+              lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0x71CC2E), 0);
+              lv_label_set_text(id(lock_badge_label), "CLOSED");
+
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+      ignore_strapping_warning: true
+    id: side_top_button
+    on_multi_click:
+      - timing:
+          - ON for at most 1s
+        then:
+          if:
+            condition:
+              lambda: 'return id(call_active);'
+            then:
+              - sip_client.hangup: phone
+            else:
+              - if:
+                  condition:
+                    lambda: 'return id(current_page) != "home";'
+                  then:
+                    - globals.set:
+                        id: current_page
+                        value: '"home"'
+                    - lvgl.page.show: home_page
+      - timing:
+          - ON for at least 1s
+        then:
+          - sip_client.hangup: phone
+
+  #── Physical top mute switch (ESP32-S3-Box-3 hardware) ──────────────────
+  # The hardware switch physically mutes the mic input. We do NOT stop/start
+  # the microphone capture or speaker here. Restarting the mic capture on the 
+  # S3-Box-3 kills the shared I2S clock (since the mic is primary), which 
+  # causes the speaker (secondary) to lose DMA buffer alignment and permanently 
+  # desync until reboot. Letting the I2S bus run continuously prevents this.
+  - platform: gpio
+    pin:
+      number: GPIO1
+      mode: INPUT_PULLUP
+      inverted: true
+      # NOTE: ignore_strapping_warning removed because GPIO1 is NOT a strapping pin
+    id: hw_mute_switch
+    name: "Mic Mute Switch"
+    entity_category: diagnostic
+    on_state:
+      then:
+        - if:
+            condition:
+              binary_sensor.is_on: hw_mute_switch
+            then:
+              - logger.log: "Hardware mute engaged"
+            else:
+              - logger.log: "Hardware mute released"
+
+  - platform: gt911
+    name: "Home Button"
+    index: 0
+    on_press:
+      if:
+        condition:
+          lambda: 'return id(call_active);'
+        then:
+          - sip_client.hangup: phone
+        else:
+          - if:
+              condition:
+                lambda: 'return id(current_page) != "home";'
+              then:
+                - globals.set:
+                    id: current_page
+                    value: '"home"'
+                - lvgl.page.show: home_page
+
+spi:
+  - id: spi_bus
+    clk_pin: 7
+    mosi_pin: 6
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_large
+    size: 40
+  - file: "gfonts://Roboto"
+    id: font_medium
+    size: 22
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 16
+  - file: "gfonts://Roboto"
+    id: font_clock
+    size: 48
+    glyphs: "0123456789:APM "
+
+globals:
+  - id: dial_buffer
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: auto_answer_enabled
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: current_page
+    type: std::string
+    restore_value: false
+    initial_value: '"home"'
+  - id: call_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True from the moment a call starts ringing until it ends - broader
+  # than call_active (which only flips on once answered). Used to decide
+  # whether the "return to call" icon should be showing on the home page.
+  - id: call_in_progress
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True only while we're the one dialing out and it hasn't connected yet.
+  # Lets the in-call page tell an outgoing "CALLING..." state apart from
+  # an incoming "RINGING..." state, so the big action button says CANCEL
+  # instead of ANSWER when you're the caller.
+  - id: call_is_outgoing
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: pin_buffer
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: door_secure_mode
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: boot_complete
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: boot_dot_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: volume_percent
+    type: int
+    restore_value: true
+    initial_value: '70'
+  # Mic gain in dB, applied to the ES7210 ADC. restore_value keeps whatever
+  # level a caller settled on across reboots, same pattern as volume_percent.
+  - id: mic_gain_db
+    type: float
+    restore_value: true
+    initial_value: '24.0'
+  # Seconds elapsed on the current call, driven by the 1s interval below.
+  # Reset when a call comes in, only counts up once the call is answered.
+  - id: call_seconds
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Drives the flash on/off state of the "return to call" icon on the
+  # home page - only relevant while a call is active and you've backed
+  # out to the home page.
+  - id: call_return_blink
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Tracks live Wi-Fi link state so the phone connector icon can go red
+  # the instant Wi-Fi drops. Updated in wifi's on_connect/on_disconnect.
+  - id: wifi_connected
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # True once the SIP client has registered with the server at least once
+  # this boot. NOTE: the sip_client component only fires on_registered a
+  # single time per boot (it never fires an "unregistered" event even if
+  # the registration later lapses), so this - combined with wifi_connected -
+  # is the closest thing to a live "connected" signal this component
+  # exposes. See the phone connector icon notes below.
+  - id: sip_registered
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+
+display:
+  - platform: mipi_spi
+    id: s3_box_lcd
+    model: S3BOX
+    data_rate: 40MHz
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    color_order: bgr
+    invert_colors: false
+
+touchscreen:
+  - platform: gt911
+    id: box_touch
+    i2c_id: bus_a
+    display: s3_box_lcd
+
+lvgl:
+  id: lv
+  displays:
+    - s3_box_lcd
+  touchscreens:
+    - box_touch
+  pages:
+    # ------------------------------------------------------------------
+    # BOOT PAGE - shown until Home Assistant actually connects, so the
+    # user isn't staring at a home screen that looks ready but silently
+    # can't talk to HA yet. Stays up and animating (not a static splash)
+    # until on_client_connected fires below.
+    # ------------------------------------------------------------------
+    - id: boot_page
+      bg_color: 0x000000
+      widgets:
+        - label:
+            text: "${friendly_name2}"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: -60
+        - arc:
+            id: boot_spinner_arc
+            align: CENTER
+            y: 10
+            width: 70
+            height: 70
+            min_value: 0
+            max_value: 100
+            value: 25
+            start_angle: 0
+            end_angle: 360
+            rotation: 0
+            adjustable: false
+            arc_width: 6
+            bg_opa: TRANSP
+            indicator:
+              arc_color: 0x3D7BFF
+              arc_width: 6
+              arc_rounded: true
+        - label:
+            id: boot_status_label
+            text: "BOOTING"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            align: CENTER
+            y: 62
+
+    # ------------------------------------------------------------------
+    # HOME PAGE
+    # ------------------------------------------------------------------
+    - id: home_page
+      bg_color: 0x000000
+      widgets:
+        - obj:
+            id: top_bar
+            x: 0
+            y: 0
+            width: 100%
+            height: 40
+            radius: 0
+            bg_color: 0xFFC107
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - button:
+                  id: apps_btn
+                  x: 8
+                  y: 4
+                  width: 80
+                  height: 32
+                  radius: 8
+                  bg_opa: TRANSP
+                  shadow_width: 0
+                  widgets:
+                    - label:
+                        text: "APPS"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0x11151C
+                  on_click:
+                    - globals.set:
+                        id: current_page
+                        value: '"apps"'
+                    - lvgl.page.show: apps_page
+              - button:
+                  id: lock_badge
+                  align: TOP_MID
+                  x: 0
+                  y: 4
+                  width: 80
+                  height: 36
+                  radius: 20
+                  bg_color: 0x71CC2E
+                  shadow_width: 0
+                  widgets:
+                    - label:
+                        id: lock_badge_label
+                        text: "CLOSED"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - if:
+                        condition:
+                          lambda: 'return id(door_secure_mode);'
+                        then:
+                          - globals.set:
+                              id: pin_buffer
+                              value: '""'
+                          - globals.set:
+                              id: current_page
+                              value: '"door_pin"'
+                          - lambda: 'lv_label_set_text(id(door_pin_display), "");'
+                          - lvgl.page.show: door_pin_page
+                        else:
+                          - if:
+                              condition:
+                                api.connected: {}
+                              then:
+                                - if:
+                                    condition:
+                                      lambda: 'return id(front_door_lock_state).state == "locked";'
+                                    then:
+                                      - homeassistant.service:
+                                          service: lock.unlock
+                                          data:
+                                            entity_id: lock.living_room_front_door_lock
+                                          on_error:
+                                            - logger.log:
+                                                format: "HA service error (lock.unlock): %s"
+                                                args: ["error.c_str()"]
+                                                tag: ha_service
+                                    else:
+                                      - homeassistant.service:
+                                          service: lock.lock
+                                          data:
+                                            entity_id: lock.living_room_front_door_lock
+                                          on_error:
+                                            - logger.log:
+                                                format: "HA service error (lock.lock): %s"
+                                                args: ["error.c_str()"]
+                                                tag: ha_service
+                              else:
+                                - logger.log:
+                                    format: "Skipped HA service call: no API connection"
+                                    tag: ha_service
+              - button:
+                  id: settings_btn
+                  align: TOP_RIGHT
+                  x: -8
+                  y: 4
+                  width: 100
+                  height: 32
+                  radius: 8
+                  bg_opa: TRANSP
+                  shadow_width: 0
+                  widgets:
+                    - label:
+                        text: "SETTINGS"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0x11151C
+                  on_click:
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - globals.set:
+                        id: current_page
+                        value: '"settings_pin"'
+                    - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
+                    - lvgl.page.show: settings_pin_page
+        - label:
+            id: clock_label
+            text: "--:--"
+            text_font: font_clock
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: -30
+        - label:
+            id: date_label
+            text: "Loading date..."
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: CENTER
+            y: 10
+        - button:
+            id: speed_dial_office
+            align: BOTTOM_LEFT
+            x: 6
+            y: -30
+            width: 50
+            height: 20
+            radius: 4
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: speed_dial_office_label_widget
+                  text: "Office"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: call_is_outgoing
+                  value: 'true'
+              - globals.set:
+                  id: call_in_progress
+                  value: 'true'
+              - globals.set:
+                  id: call_seconds
+                  value: '0'
+              - lambda: |-
+                  std::string caller_txt = "Calling: " + id(speed_dial_office_label).state;
+                  lv_label_set_text(id(caller_id_label), caller_txt.c_str());
+                  lv_label_set_text(id(incall_status_label), "CALLING...");
+                  lv_label_set_text(id(call_timer_label), "00:00");
+                  lv_label_set_text(id(answer_btn_label), "CANCEL");
+                  lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+              - script.execute: update_status_icons
+              - globals.set:
+                  id: current_page
+                  value: '"incall"'
+              - lvgl.page.show: incall_page
+              - sip_client.call:
+                  id: phone
+                  number: !lambda 'return id(speed_dial_office_number).state;'
+        - button:
+            id: speed_dial_cell_btn
+            align: BOTTOM_LEFT
+            x: 60
+            y: -30
+            width: 42
+            height: 20
+            radius: 4
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: speed_dial_cell_label_widget
+                  text: "Cell"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: call_is_outgoing
+                  value: 'true'
+              - globals.set:
+                  id: call_in_progress
+                  value: 'true'
+              - globals.set:
+                  id: call_seconds
+                  value: '0'
+              - lambda: |-
+                  std::string caller_txt = "Calling: " + id(speed_dial_cell_label).state;
+                  lv_label_set_text(id(caller_id_label), caller_txt.c_str());
+                  lv_label_set_text(id(incall_status_label), "CALLING...");
+                  lv_label_set_text(id(call_timer_label), "00:00");
+                  lv_label_set_text(id(answer_btn_label), "CANCEL");
+                  lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+              - script.execute: update_status_icons
+              - globals.set:
+                  id: current_page
+                  value: '"incall"'
+              - lvgl.page.show: incall_page
+              - sip_client.call:
+                  id: phone
+                  number: !lambda 'return id(speed_dial_cell_number).state;'
+        - button:
+            id: speed_dial_3_btn
+            align: BOTTOM_LEFT
+            x: 104
+            y: -30
+            width: 50
+            height: 20
+            radius: 4
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: speed_dial_3_label_widget
+                  text: "Dial 3"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: call_is_outgoing
+                  value: 'true'
+              - globals.set:
+                  id: call_in_progress
+                  value: 'true'
+              - globals.set:
+                  id: call_seconds
+                  value: '0'
+              - lambda: |-
+                  std::string caller_txt = "Calling: " + id(speed_dial_3_label).state;
+                  lv_label_set_text(id(caller_id_label), caller_txt.c_str());
+                  lv_label_set_text(id(incall_status_label), "CALLING...");
+                  lv_label_set_text(id(call_timer_label), "00:00");
+                  lv_label_set_text(id(answer_btn_label), "CANCEL");
+                  lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+              - script.execute: update_status_icons
+              - globals.set:
+                  id: current_page
+                  value: '"incall"'
+              - lvgl.page.show: incall_page
+              - sip_client.call:
+                  id: phone
+                  number: !lambda 'return id(speed_dial_3_number).state;'
+        - button:
+            id: speed_dial_4_btn
+            align: BOTTOM_LEFT
+            x: 156
+            y: -30
+            width: 50
+            height: 20
+            radius: 4
+            bg_color: 0x1F2632
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: speed_dial_4_label_widget
+                  text: "Dial 4"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: call_is_outgoing
+                  value: 'true'
+              - globals.set:
+                  id: call_in_progress
+                  value: 'true'
+              - globals.set:
+                  id: call_seconds
+                  value: '0'
+              - lambda: |-
+                  std::string caller_txt = "Calling: " + id(speed_dial_4_label).state;
+                  lv_label_set_text(id(caller_id_label), caller_txt.c_str());
+                  lv_label_set_text(id(incall_status_label), "CALLING...");
+                  lv_label_set_text(id(call_timer_label), "00:00");
+                  lv_label_set_text(id(answer_btn_label), "CANCEL");
+                  lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+              - script.execute: update_status_icons
+              - globals.set:
+                  id: current_page
+                  value: '"incall"'
+              - lvgl.page.show: incall_page
+              - sip_client.call:
+                  id: phone
+                  number: !lambda 'return id(speed_dial_4_number).state;'
+        - obj:
+            id: phone_status_group
+            align: BOTTOM_LEFT
+            x: 6
+            y: -2
+            width: 172
+            height: 24
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            widgets:
+              # Phone connector icon - doubles as the SIP connection status
+              # (green = registered, red = no connection) AND the busy
+              # indicator (amber "line through the phone" while ringing,
+              # dialing, or on a call). Driven entirely by the
+              # update_status_icons script - see its comments for the
+              # exact color/state logic and its caveats.
+              - label:
+                  id: phone_icon_label
+                  text: "\uF095"
+                  align: LEFT_MID
+                  x: 0
+                  text_font: montserrat_18
+                  text_color: 0xE74C3C
+              # Mic-in-use icon - red while a call is live (mic audio is
+              # actually being sent), green otherwise. Uses the built-in
+              # LVGL "volume" glyph since the bundled montserrat_18 icon
+              # font has no dedicated microphone symbol.
+              - label:
+                  id: mic_status_icon
+                  text: "\uF028"
+                  align: LEFT_MID
+                  x: 28
+                  text_font: montserrat_18
+                  text_color: 0x2ECC71
+              # Auto-answer icon - green off, red on-and-a-call-is-live,
+              # orange on-but-idle/armed. Uses the "loop" glyph as a stand-in
+              # for "auto".
+              - label:
+                  id: auto_answer_status_icon
+                  text: "\uF079"
+                  align: LEFT_MID
+                  x: 56
+                  text_font: montserrat_18
+                  text_color: 0x2ECC71
+              - label:
+                  id: ha_status_icon
+                  text: "\uF015"
+                  align: LEFT_MID
+                  x: 88
+                  text_font: montserrat_18
+                  text_color: 0xE74C3C
+              - label:
+                  id: wifi_status_icon
+                  text: "\uF1EB"
+                  align: LEFT_MID
+                  x: 120
+                  text_font: montserrat_18
+                  text_color: 0xE74C3C
+        - obj:
+            id: battery_status_group
+            align: BOTTOM_RIGHT
+            x: -6
+            y: -2
+            width: 64
+            height: 24
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  id: battery_icon_label
+                  text: "\uF240"
+                  align: LEFT_MID
+                  x: 0
+                  text_font: montserrat_18
+                  text_color: 0xFFFFFF
+              - label:
+                  id: battery_status_label
+                  text: "--"
+                  align: LEFT_MID
+                  x: 26
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+        # Flashing "return to call" badge - hidden unless a call is in
+        # progress (the 500ms interval above shows/hides it and pulses
+        # the amber bg_color + shadow to make it glow, like the light's
+        # coming from behind the icon rather than a flat blink). Sits in
+        # the bottom-right corner, right above the battery indicator.
+        # Tapping it jumps straight back to the in-call page, so you can
+        # hop away to use the rest of the app mid-call and still find
+        # your way back easily.
+        - button:
+            id: call_return_btn
+            align: BOTTOM_RIGHT
+            x: -6
+            y: -32
+            width: 36
+            height: 36
+            radius: 18
+            bg_color: 0xFFC107
+            border_width: 0
+            shadow_width: 20
+            shadow_spread: 4
+            shadow_ofs_x: 0
+            shadow_ofs_y: 0
+            shadow_color: 0xFFD65C
+            shadow_opa: COVER
+            hidden: true
+            widgets:
+              - label:
+                  text: "\uF095"
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0x241700
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"incall"'
+              - lvgl.page.show: incall_page
+
+    # ------------------------------------------------------------------
+    # APPS PAGE
+    # ------------------------------------------------------------------
+    - id: apps_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Apps"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 12
+            y: 10
+        - button:
+            id: exit_apps_btn
+            align: TOP_RIGHT
+            x: -10
+            y: 6
+            width: 70
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "EXIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+        - button:
+            id: open_lights_btn
+            x: 15
+            y: 60
+            width: 140
+            height: 90
+            radius: 16
+            bg_color: 0x3D7BFF
+            widgets:
+              - label:
+                  text: "LIGHTS"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"lights"'
+              - lvgl.page.show: lights_page
+        - button:
+            id: open_ir_btn
+            x: 165
+            y: 60
+            width: 140
+            height: 90
+            radius: 16
+            bg_color: 0x8E44AD
+            widgets:
+              - label:
+                  text: "IR"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"ir"'
+              - lvgl.page.show: ir_page
+        - button:
+            id: open_phone_btn
+            x: 15
+            y: 160
+            width: 290
+            height: 60
+            radius: 16
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  text: "PHONE"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"dialpad"'
+              - lvgl.page.show: dialpad_page
+
+    # ------------------------------------------------------------------
+    # LIGHTS PAGE  (ported from old.yaml's liv_lite_page — fill in
+    # light_widget_entity in substitutions at the top of this file)
+    # ------------------------------------------------------------------
+    - id: lights_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Lights"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 12
+            y: 10
+        - button:
+            id: exit_lights_btn
+            align: TOP_RIGHT
+            x: -10
+            y: 6
+            width: 70
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "EXIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"apps"'
+              - lvgl.page.show: apps_page
+        - button:
+            id: light_power_btn
+            x: 12
+            y: 54
+            width: 90
+            height: 46
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "POWER"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFCC00
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: ${light_widget_entity}
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.toggle): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: daylight_reset_btn
+            x: 218
+            y: 54
+            width: 90
+            height: 46
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Daylight"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFEE88
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                          color_temp_kelvin: "4000"
+                          brightness_pct: "100"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on daylight): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                    - lvgl.slider.update:
+                        id: light_temp_slider
+                        value: 4000
+                    - lvgl.slider.update:
+                        id: light_brightness_slider
+                        value: 100
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - label:
+            text: "Brightness"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 12
+            y: 112
+        - slider:
+            id: light_brightness_slider
+            x: 12
+            y: 132
+            width: 296
+            height: 16
+            min_value: 0
+            max_value: 100
+            value: 50
+            bg_color: 0x1F2632
+            indicator:
+              bg_color: 0xFFCC00
+            knob:
+              bg_color: 0xFFCC00
+            on_release:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data_template:
+                          entity_id: ${light_widget_entity}
+                          brightness_pct: !lambda 'return str_sprintf("%d", (int) x);'
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on brightness): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - label:
+            text: "Color Temperature"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 12
+            y: 156
+        - slider:
+            id: light_temp_slider
+            x: 12
+            y: 176
+            width: 296
+            height: 16
+            min_value: 2000
+            max_value: 6500
+            value: 4000
+            bg_color: 0x1F2632
+            indicator:
+              bg_color: 0x88CCFF
+            knob:
+              bg_color: 0xFFFFFF
+            on_release:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data_template:
+                          entity_id: ${light_widget_entity}
+                          color_temp_kelvin: !lambda 'return str_sprintf("%d", (int) x);'
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on kelvin): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - label:
+            text: "Colour"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 12
+            y: 200
+        - button:
+            id: color_btn_red
+            x: 12
+            y: 220
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFF2222
+            widgets:
+              - label:
+                  text: "Red"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 34, 34]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on red): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_orange
+            x: 84
+            y: 220
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFF7700
+            widgets:
+              - label:
+                  text: "Orange"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 119, 0]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on orange): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_yellow
+            x: 156
+            y: 220
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFFEE00
+            widgets:
+              - label:
+                  text: "Yellow"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0x333333
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 238, 0]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on yellow): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_green
+            x: 228
+            y: 220
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0x00DD00
+            widgets:
+              - label:
+                  text: "Green"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[0, 221, 0]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on green): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_teal
+            x: 12
+            y: 250
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0x00BBBB
+            widgets:
+              - label:
+                  text: "Teal"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[0, 187, 187]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on teal): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_sky
+            x: 84
+            y: 250
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0x00AAFF
+            widgets:
+              - label:
+                  text: "Sky"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[0, 170, 255]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on sky): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_blue
+            x: 156
+            y: 250
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0x2244FF
+            widgets:
+              - label:
+                  text: "Blue"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[34, 68, 255]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on blue): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_purple
+            x: 228
+            y: 250
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xAA00FF
+            widgets:
+              - label:
+                  text: "Purple"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[170, 0, 255]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on purple): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_pink
+            x: 12
+            y: 280
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFF00BB
+            widgets:
+              - label:
+                  text: "Pink"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 0, 187]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on pink): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_rose
+            x: 84
+            y: 280
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFF4488
+            widgets:
+              - label:
+                  text: "Rose"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 68, 136]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on rose): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_peach
+            x: 156
+            y: 280
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFFBB55
+            widgets:
+              - label:
+                  text: "Peach"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0x333333
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 187, 85]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on peach): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+        - button:
+            id: color_btn_white
+            x: 228
+            y: 280
+            width: 68
+            height: 26
+            radius: 6
+            bg_color: 0xFFFFFF
+            widgets:
+              - label:
+                  text: "White"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0x333333
+            on_click:
+              - if:
+                  condition:
+                    api.connected: {}
+                  then:
+                    - homeassistant.service:
+                        service: light.turn_on
+                        data:
+                          entity_id: ${light_widget_entity}
+                        data_template:
+                          rgb_color: "[255, 255, 255]"
+                        on_error:
+                          - logger.log:
+                              format: "HA service error (light.turn_on white): %s"
+                              args: ["error.c_str()"]
+                              tag: ha_service
+                  else:
+                    - logger.log:
+                        format: "Skipped HA service call: no API connection"
+                        tag: ha_service
+
+    # ------------------------------------------------------------------
+    # IR PAGE  (ported from old.yaml's menu_pages_page IR grid — fill in
+    # menu_fan_entity / menu_tv_entity / menu_soundbar_entity in
+    # substitutions at the top of this file)
+    # ------------------------------------------------------------------
+    - id: ir_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "IR"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 12
+            y: 10
+        - button:
+            id: exit_ir_btn
+            align: TOP_RIGHT
+            x: -10
+            y: 6
+            width: 70
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "EXIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"apps"'
+              - lvgl.page.show: apps_page
+        - button:
+            id: soundbar_btn
+            x: 15
+            y: 60
+            width: 290
+            height: 54
+            radius: 14
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Soundbar"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - switch.toggle: sw_menu_soundbar
+        - button:
+            id: tv_ir_btn
+            x: 15
+            y: 124
+            width: 290
+            height: 54
+            radius: 14
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "TV"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - homeassistant.service:
+                  service: switch.toggle
+                  data:
+                    entity_id: ${menu_tv_entity}
+        - button:
+            id: fan_btn
+            x: 15
+            y: 188
+            width: 290
+            height: 54
+            radius: 14
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Fan"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - switch.toggle: sw_menu_fan
+
+    # ------------------------------------------------------------------
+    # SETTINGS PIN ENTRY PAGE
+    # ------------------------------------------------------------------
+    - id: settings_pin_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Enter Settings PIN"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 6
+        - label:
+            id: settings_pin_display
+            text: ""
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 34
+        - button:
+            id: settings_pin_1
+            x: 15
+            y: 62
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "1", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "1";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_2
+            x: 115
+            y: 62
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "2", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "2";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_3
+            x: 215
+            y: 62
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "3", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "3";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_4
+            x: 15
+            y: 108
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "4", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "4";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_5
+            x: 115
+            y: 108
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "5", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "5";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_6
+            x: 215
+            y: 108
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "6", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "6";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_7
+            x: 15
+            y: 154
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "7", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "7";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_8
+            x: 115
+            y: 154
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "8", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "8";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_9
+            x: 215
+            y: 154
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "9", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "9";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_clear
+            x: 15
+            y: 200
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0xE74C3C
+            widgets:
+              - label: { text: "Clear", align: CENTER, text_font: font_small }
+            on_click:
+              - globals.set:
+                  id: pin_buffer
+                  value: '""'
+              - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
+        - button:
+            id: settings_pin_0
+            x: 115
+            y: 200
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "0", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "0";
+                  lv_label_set_text(id(settings_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: settings_pin_enter
+            x: 215
+            y: 200
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label: { text: "Enter", align: CENTER, text_font: font_small }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(pin_buffer) == "${settings_pin}";'
+                  then:
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - globals.set:
+                        id: current_page
+                        value: '"settings"'
+                    - lvgl.page.show: settings_page
+                  else:
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - lambda: 'lv_label_set_text(id(settings_pin_display), "Wrong PIN");'
+
+    # ------------------------------------------------------------------
+    # DOOR PIN ENTRY PAGE
+    # ------------------------------------------------------------------
+    - id: door_pin_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Enter Door PIN"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 6
+        - label:
+            id: door_pin_display
+            text: ""
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 34
+        - button:
+            id: door_pin_1
+            x: 15
+            y: 62
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "1", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "1";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_2
+            x: 115
+            y: 62
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "2", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "2";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_3
+            x: 215
+            y: 62
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "3", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "3";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_4
+            x: 15
+            y: 108
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "4", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "4";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_5
+            x: 115
+            y: 108
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "5", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "5";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_6
+            x: 215
+            y: 108
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "6", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "6";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_7
+            x: 15
+            y: 154
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "7", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "7";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_8
+            x: 115
+            y: 154
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "8", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "8";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_9
+            x: 215
+            y: 154
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "9", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "9";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_clear
+            x: 15
+            y: 200
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0xE74C3C
+            widgets:
+              - label: { text: "Clear", align: CENTER, text_font: font_small }
+            on_click:
+              - globals.set:
+                  id: pin_buffer
+                  value: '""'
+              - lambda: 'lv_label_set_text(id(door_pin_display), "");'
+        - button:
+            id: door_pin_0
+            x: 115
+            y: 200
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "0", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(pin_buffer) += "0";
+                  lv_label_set_text(id(door_pin_display), id(pin_buffer).c_str());
+        - button:
+            id: door_pin_enter
+            x: 215
+            y: 200
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label: { text: "Enter", align: CENTER, text_font: font_small }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(pin_buffer) == "${door_pin}";'
+                  then:
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - globals.set:
+                        id: current_page
+                        value: '"home"'
+                    - lvgl.page.show: home_page
+                    - if:
+                        condition:
+                          api.connected: {}
+                        then:
+                          - if:
+                              condition:
+                                lambda: 'return id(front_door_lock_state).state == "locked";'
+                              then:
+                                - homeassistant.service:
+                                    service: lock.unlock
+                                    data:
+                                      entity_id: lock.living_room_front_door_lock
+                                    on_error:
+                                      - logger.log:
+                                          format: "HA service error (lock.unlock via PIN): %s"
+                                          args: ["error.c_str()"]
+                                          tag: ha_service
+                              else:
+                                - homeassistant.service:
+                                    service: lock.lock
+                                    data:
+                                      entity_id: lock.living_room_front_door_lock
+                                    on_error:
+                                      - logger.log:
+                                          format: "HA service error (lock.lock via PIN): %s"
+                                          args: ["error.c_str()"]
+                                          tag: ha_service
+                        else:
+                          - logger.log:
+                              format: "Skipped HA service call: no API connection"
+                              tag: ha_service
+                  else:
+                    - globals.set:
+                        id: pin_buffer
+                        value: '""'
+                    - lambda: 'lv_label_set_text(id(door_pin_display), "Wrong PIN");'
+
+    # ------------------------------------------------------------------
+    # DIAL PAD PAGE
+    # ------------------------------------------------------------------
+    - id: dialpad_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            id: dial_display
+            text: ""
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 6
+        - button:
+            id: dial_btn_1
+            x: 15
+            y: 30
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "1", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "1";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_2
+            x: 115
+            y: 30
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "2", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "2";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_3
+            x: 215
+            y: 30
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "3", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "3";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_4
+            x: 15
+            y: 76
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "4", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "4";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_5
+            x: 115
+            y: 76
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "5", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "5";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_6
+            x: 215
+            y: 76
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "6", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "6";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_7
+            x: 15
+            y: 122
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "7", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "7";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_8
+            x: 115
+            y: 122
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "8", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "8";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_9
+            x: 215
+            y: 122
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "9", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "9";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_star
+            x: 15
+            y: 168
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "*", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "*";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_0
+            x: 115
+            y: 168
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "0", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "0";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: dial_btn_hash
+            x: 215
+            y: 168
+            width: 90
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label: { text: "#", align: CENTER, text_font: font_medium }
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) += "#";
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+        - button:
+            id: cancel_dial_btn
+            x: 15
+            y: 204
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Back"
+                  align: CENTER
+                  text_font: font_small
+            on_click:
+              - lambda: |-
+                  id(dial_buffer) = "";
+                  lv_label_set_text(id(dial_display), "");
+              - globals.set:
+                  id: current_page
+                  value: '"apps"'
+              - lvgl.page.show: apps_page
+        - button:
+            id: call_btn
+            x: 115
+            y: 204
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  text: "Call"
+                  align: CENTER
+                  text_font: font_small
+            on_click:
+              - if:
+                  # Only place the call if something's actually been dialed -
+                  # otherwise silently do nothing rather than opening the
+                  # in-call page for an empty number.
+                  condition:
+                    lambda: 'return !id(dial_buffer).empty();'
+                  then:
+                    - globals.set:
+                        id: call_is_outgoing
+                        value: 'true'
+                    - globals.set:
+                        id: call_in_progress
+                        value: 'true'
+                    - globals.set:
+                        id: call_seconds
+                        value: '0'
+                    - lambda: |-
+                        std::string caller_txt = "Calling: " + id(dial_buffer);
+                        lv_label_set_text(id(caller_id_label), caller_txt.c_str());
+                        lv_label_set_text(id(incall_status_label), "CALLING...");
+                        lv_label_set_text(id(call_timer_label), "00:00");
+                        lv_label_set_text(id(answer_btn_label), "CANCEL");
+                        lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
+                        char buf[12];
+                        snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                        lv_label_set_text(id(incall_mic_gain_label), buf);
+                    - script.execute: update_status_icons
+                    - globals.set:
+                        id: current_page
+                        value: '"incall"'
+                    - lvgl.page.show: incall_page
+                    - sip_client.call:
+                        id: phone
+                        number: !lambda 'return id(dial_buffer);'
+        - button:
+            id: backspace_btn
+            x: 215
+            y: 204
+            width: 90
+            height: 32
+            radius: 10
+            bg_color: 0xE74C3C
+            widgets:
+              - label:
+                  text: "Del"
+                  align: CENTER
+                  text_font: font_small
+            on_click:
+              - lambda: |-
+                  if (!id(dial_buffer).empty()) id(dial_buffer).pop_back();
+                  lv_label_set_text(id(dial_display), id(dial_buffer).c_str());
+
+    # ------------------------------------------------------------------
+    # IN-CALL PAGE
+    # ------------------------------------------------------------------
+    - id: incall_page
+      bg_color: 0x11151C
+      widgets:
+        # Caller ID / phone status strip - two stacked black bars across
+        # the top, matching the mockup.
+        - obj:
+            id: caller_id_bar
+            x: 0
+            y: 0
+            width: 320
+            height: 45
+            radius: 0
+            bg_color: 0x000000
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  id: caller_id_label
+                  text: "Caller: --"
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+                  align: CENTER
+        - obj:
+            id: phone_status_bar
+            x: 0
+            y: 45
+            width: 320
+            height: 45
+            radius: 0
+            bg_color: 0x000000
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  id: incall_status_label
+                  text: "RINGING..."
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+                  align: CENTER
+        # Call duration, simple text right under the status bar - no box.
+        - label:
+            id: call_timer_label
+            text: "00:00"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 94
+        # This device's own SIP extension (not the caller's number) -
+        # a fixed value from the substitution, so no runtime update needed.
+        - label:
+            text: "EXT#:"
+            text_font: font_medium
+            text_color: 0x2ECC71
+            x: 8
+            y: 124
+        - label:
+            id: caller_ext_label
+            text: "${voip_test_account_extension}"
+            text_font: font_medium
+            text_color: 0x2ECC71
+            x: 75
+            y: 124
+        # Live mic gain adjustment during an active call - hits the ES7210 ADC
+        # register directly (no capture restart), so the level changes
+        # instantly and the caller can ask "can you hear me now?" on the
+        # spot. Same global as the Settings page control, so whatever level
+        # they land on here is what's saved/restored going forward.
+        - label:
+            text: "MIC LEVEL:"
+            text_font: font_small
+            text_color: 0xFFFFFF
+            x: 8
+            y: 160
+        - label:
+            id: incall_mic_gain_label
+            text: "24.0dB"
+            text_font: font_small
+            text_color: 0xFFFFFF
+            x: 105
+            y: 160
+        - button:
+            id: incall_mic_down_btn
+            x: 170
+            y: 154
+            width: 36
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "-"
+                  align: CENTER
+                  text_font: font_medium
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) - 3.0;
+                  if (g < 0.0) g = 0.0;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+                  lv_label_set_text(id(mic_gain_label), buf);
+        - button:
+            id: incall_mic_up_btn
+            x: 212
+            y: 154
+            width: 36
+            height: 30
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "+"
+                  align: CENTER
+                  text_font: font_medium
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) + 3.0;
+                  if (g > 37.5) g = 37.5;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+                  lv_label_set_text(id(mic_gain_label), buf);
+        # Bottom action row - just two buttons now. The red button never
+        # ends the call; it backs out to the home page while the call
+        # keeps running (SIP audio isn't tied to which LVGL page is
+        # shown), and the flashing phone icon on the home page lets you
+        # jump back here. The green button answers while ringing, then
+        # turns into a red End Call button once connected.
+        - button:
+            id: hangup_btn
+            x: 5
+            y: 186
+            width: 150
+            height: 48
+            radius: 12
+            bg_color: 0xE74C3C
+            widgets:
+              - label:
+                  text: "MINIMIZE CALL"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+        - button:
+            id: answer_btn
+            x: 165
+            y: 186
+            width: 150
+            height: 48
+            radius: 12
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  id: answer_btn_label
+                  text: "ANSWER"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - if:
+                  # Once connected, or while we're the one dialing out
+                  # (call_is_outgoing), this button always hangs up/cancels.
+                  # It only answers when we're on the receiving end of a
+                  # still-ringing incoming call.
+                  condition:
+                    lambda: 'return id(call_active) || id(call_is_outgoing);'
+                  then:
+                    - sip_client.hangup: phone
+                  else:
+                    - sip_client.answer: phone
+
+    # ------------------------------------------------------------------
+    # SETTINGS PAGE
+    # ------------------------------------------------------------------
+    - id: settings_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Settings"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            y: 6
+        - label:
+            text: "Auto-Answer"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 10
+            y: 34
+        - switch:
+            id: auto_answer_switch
+            x: 250
+            y: 30
+            on_click:
+              - switch.toggle: voip_auto_answer
+        - label:
+            text: "Mute Speaker"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 10
+            y: 64
+        - switch:
+            id: mute_switch
+            x: 250
+            y: 60
+            on_click:
+              - switch.toggle: speaker_mute
+        - label:
+            text: "Require PIN for Lock"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 10
+            y: 94
+        - switch:
+            id: door_secure_switch
+            x: 250
+            y: 90
+            on_click:
+              - switch.toggle: door_secure_mode_switch
+        - label:
+            text: "Volume"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 10
+            y: 124
+        - button:
+            id: volume_down_btn
+            x: 10
+            y: 142
+            width: 60
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "-"
+                  align: CENTER
+                  text_font: font_medium
+            on_click:
+              - lambda: |-
+                  int v = id(volume_percent) - 5;
+                  if (v < 0) v = 0;
+                  id(volume_percent) = v;
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return id(volume_percent) / 100.0;'
+              - lambda: |-
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                  lv_label_set_text(id(volume_percent_label), buf);
+        - label:
+            id: volume_percent_label
+            text: "70%"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            x: 0
+            y: 142
+        - button:
+            id: volume_up_btn
+            x: 250
+            y: 142
+            width: 60
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "+"
+                  align: CENTER
+                  text_font: font_medium
+            on_click:
+              - lambda: |-
+                  int v = id(volume_percent) + 5;
+                  if (v > 100) v = 100;
+                  id(volume_percent) = v;
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return id(volume_percent) / 100.0;'
+              - lambda: |-
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+                  lv_label_set_text(id(volume_percent_label), buf);
+        - label:
+            text: "Mic Gain"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 10
+            y: 184
+        - button:
+            id: mic_gain_down_btn
+            x: 10
+            y: 202
+            width: 60
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "-"
+                  align: CENTER
+                  text_font: font_medium
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) - 3.0;
+                  if (g < 0.0) g = 0.0;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(mic_gain_label), buf);
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+        - label:
+            id: mic_gain_label
+            text: "24.0dB"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_MID
+            x: 0
+            y: 202
+        - button:
+            id: mic_gain_up_btn
+            x: 250
+            y: 202
+            width: 60
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "+"
+                  align: CENTER
+                  text_font: font_medium
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) + 3.0;
+                  if (g > 37.5) g = 37.5;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(mic_gain_label), buf);
+                  lv_label_set_text(id(incall_mic_gain_label), buf);
+        - label:
+            text: "Backlight"
+            text_font: font_small
+            text_color: 0xB7C0CC
+            x: 10
+            y: 244
+        - slider:
+            id: brightness_slider
+            x: 10
+            y: 262
+            width: 300
+            height: 16
+            min_value: 10
+            max_value: 100
+            value: 100
+            bg_color: 0x1F2632
+            indicator:
+              bg_color: 0x3D7BFF
+            knob:
+              bg_color: 0xFFFFFF
+            on_release:
+              - light.turn_on:
+                  id: led
+                  brightness: !lambda 'return x / 100.0;'
+        - button:
+            id: back_from_settings_btn
+            align: CENTER
+            y: 290
+            width: 130
+            height: 30
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Back"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"home"'
+              - lvgl.page.show: home_page
+
+switch:
+  #── IR device mirrors — ported from old.yaml's sw_menu_* pattern. Each
+  # mirrors the real HA switch: switch.toggle sends the command, and
+  # on_turn_on/on_turn_off recolor the IR page button to match whatever
+  # actually changed the state (button, remote, automation). ──
+  - platform: homeassistant
+    id: sw_menu_fan
+    entity_id: ${menu_fan_entity}
+    internal: true
+    on_turn_on:
+      lambda: |-
+        lv_obj_set_style_bg_color(id(fan_btn), lv_color_hex(0x3D7BFF), 0);
+    on_turn_off:
+      lambda: |-
+        lv_obj_set_style_bg_color(id(fan_btn), lv_color_hex(0x1F2632), 0);
+  - platform: homeassistant
+    id: sw_menu_soundbar
+    entity_id: ${menu_soundbar_entity}
+    internal: true
+    on_turn_on:
+      lambda: |-
+        lv_obj_set_style_bg_color(id(soundbar_btn), lv_color_hex(0x3D7BFF), 0);
+    on_turn_off:
+      lambda: |-
+        lv_obj_set_style_bg_color(id(soundbar_btn), lv_color_hex(0x1F2632), 0);
+  - platform: template
+    name: "Speaker Mute"
+    id: speaker_mute
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - audio_dac.mute_on: es8311_dac
+      - lvgl.widget.update:
+          id: mute_switch
+          state:
+            checked: true
+    turn_off_action:
+      - audio_dac.mute_off: es8311_dac
+      - lvgl.widget.update:
+          id: mute_switch
+          state:
+            checked: false
+  - platform: template
+    name: "Intercom Auto Answer"
+    id: voip_auto_answer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: auto_answer_enabled
+          value: 'true'
+      - lvgl.widget.update:
+          id: auto_answer_switch
+          state:
+            checked: true
+      - script.execute: update_status_icons
+    turn_off_action:
+      - globals.set:
+          id: auto_answer_enabled
+          value: 'false'
+      - lvgl.widget.update:
+          id: auto_answer_switch
+          state:
+            checked: false
+      - script.execute: update_status_icons
+  - platform: template
+    name: "Door Lock PIN Required"
+    id: door_secure_mode_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: door_secure_mode
+          value: 'true'
+      - lvgl.widget.update:
+          id: door_secure_switch
+          state:
+            checked: true
+    turn_off_action:
+      - globals.set:
+          id: door_secure_mode
+          value: 'false'
+      - lvgl.widget.update:
+          id: door_secure_switch
+          state:
+            checked: false
+  - platform: gpio
+    id: speaker_enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON
+
+text:
+  # Editable from the ESPHome device page in HA, same as the switches above.
+  # optimistic: true means the entity just stores/reports back whatever it's
+  # set to - no lambda needed. restore_value: true keeps it across reboots.
+  - platform: template
+    name: "Speed Dial Office Number"
+    id: speed_dial_office_number
+    icon: "mdi:phone"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 32
+    initial_value: "705"
+  - platform: template
+    name: "Speed Dial Office Label"
+    id: speed_dial_office_label
+    icon: "mdi:label-outline"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 12
+    initial_value: "Office"
+    on_value:
+      - lvgl.label.update:
+          id: speed_dial_office_label_widget
+          text: !lambda 'return x;'
+  - platform: template
+    name: "Speed Dial Cell Number"
+    id: speed_dial_cell_number
+    icon: "mdi:phone"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 32
+    # Placeholder - swap in the real cell number whenever ready.
+    initial_value: "0000000000"
+  - platform: template
+    name: "Speed Dial Cell Label"
+    id: speed_dial_cell_label
+    icon: "mdi:label-outline"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 12
+    initial_value: "Cell"
+    on_value:
+      - lvgl.label.update:
+          id: speed_dial_cell_label_widget
+          text: !lambda 'return x;'
+  # Two extra speed dial slots, same pattern as Office/Cell above, shown as
+  # two more buttons on the home page row. The button layout is fixed at
+  # compile time (LVGL objects on an ESP32 aren't created dynamically from
+  # Home Assistant), so "adding a speed dial" here means filling in one of
+  # these pre-built slots rather than an open-ended list - see the reply
+  # for how to add more slots beyond these four if needed.
+  - platform: template
+    name: "Speed Dial 3 Number"
+    id: speed_dial_3_number
+    icon: "mdi:phone"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 32
+    initial_value: ""
+  - platform: template
+    name: "Speed Dial 3 Label"
+    id: speed_dial_3_label
+    icon: "mdi:label-outline"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 12
+    initial_value: "Dial 3"
+    on_value:
+      - lvgl.label.update:
+          id: speed_dial_3_label_widget
+          text: !lambda 'return x;'
+  - platform: template
+    name: "Speed Dial 4 Number"
+    id: speed_dial_4_number
+    icon: "mdi:phone"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 32
+    initial_value: ""
+  - platform: template
+    name: "Speed Dial 4 Label"
+    id: speed_dial_4_label
+    icon: "mdi:label-outline"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 12
+    initial_value: "Dial 4"
+    on_value:
+      - lvgl.label.update:
+          id: speed_dial_4_label_widget
+          text: !lambda 'return x;'
+
+select:
+  # Button and text color pickers for all four speed dial buttons, exposed
+  # as HA select entities (Settings > Devices > this device) so colors can
+  # be changed without reflashing. Options map to fixed hex colors below;
+  # add more names/hex pairs to the options + lambda pair together if you
+  # want a bigger palette.
+  - platform: template
+    name: "Speed Dial Office Button Color"
+    id: speed_dial_office_button_color
+    icon: "mdi:palette"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["Gray", "Blue", "Green", "Red", "Orange", "Purple", "White"]
+    initial_option: "Gray"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0x1F2632;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "White") c = 0xFFFFFF;
+          lv_obj_set_style_bg_color(id(speed_dial_office), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial Office Text Color"
+    id: speed_dial_office_text_color
+    icon: "mdi:format-color-text"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["White", "Blue", "Green", "Red", "Orange", "Purple", "Gray"]
+    initial_option: "White"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0xFFFFFF;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "Gray") c = 0x1F2632;
+          lv_obj_set_style_text_color(id(speed_dial_office_label_widget), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial Cell Button Color"
+    id: speed_dial_cell_button_color
+    icon: "mdi:palette"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["Gray", "Blue", "Green", "Red", "Orange", "Purple", "White"]
+    initial_option: "Gray"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0x1F2632;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "White") c = 0xFFFFFF;
+          lv_obj_set_style_bg_color(id(speed_dial_cell_btn), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial Cell Text Color"
+    id: speed_dial_cell_text_color
+    icon: "mdi:format-color-text"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["White", "Blue", "Green", "Red", "Orange", "Purple", "Gray"]
+    initial_option: "White"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0xFFFFFF;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "Gray") c = 0x1F2632;
+          lv_obj_set_style_text_color(id(speed_dial_cell_label_widget), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial 3 Button Color"
+    id: speed_dial_3_button_color
+    icon: "mdi:palette"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["Gray", "Blue", "Green", "Red", "Orange", "Purple", "White"]
+    initial_option: "Gray"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0x1F2632;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "White") c = 0xFFFFFF;
+          lv_obj_set_style_bg_color(id(speed_dial_3_btn), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial 3 Text Color"
+    id: speed_dial_3_text_color
+    icon: "mdi:format-color-text"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["White", "Blue", "Green", "Red", "Orange", "Purple", "Gray"]
+    initial_option: "White"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0xFFFFFF;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "Gray") c = 0x1F2632;
+          lv_obj_set_style_text_color(id(speed_dial_3_label_widget), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial 4 Button Color"
+    id: speed_dial_4_button_color
+    icon: "mdi:palette"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["Gray", "Blue", "Green", "Red", "Orange", "Purple", "White"]
+    initial_option: "Gray"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0x1F2632;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "White") c = 0xFFFFFF;
+          lv_obj_set_style_bg_color(id(speed_dial_4_btn), lv_color_hex(c), 0);
+  - platform: template
+    name: "Speed Dial 4 Text Color"
+    id: speed_dial_4_text_color
+    icon: "mdi:format-color-text"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options: ["White", "Blue", "Green", "Red", "Orange", "Purple", "Gray"]
+    initial_option: "White"
+    on_value:
+      - lambda: |-
+          uint32_t c = 0xFFFFFF;
+          if (x == "Blue") c = 0x3D7BFF;
+          else if (x == "Green") c = 0x2ECC71;
+          else if (x == "Red") c = 0xE74C3C;
+          else if (x == "Orange") c = 0xFFA500;
+          else if (x == "Purple") c = 0x8E44AD;
+          else if (x == "Gray") c = 0x1F2632;
+          lv_obj_set_style_text_color(id(speed_dial_4_label_widget), lv_color_hex(c), 0);

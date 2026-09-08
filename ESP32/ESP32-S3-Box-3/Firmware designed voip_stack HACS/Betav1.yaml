@@ -1,0 +1,1087 @@
+substitutions:
+  name: esp32-s3box-3
+  friendly_name: ESP32-S3-Box-3
+
+  external_media_player: living_room_speaker
+  home_assistant_host: http://192.168.8.162:8123
+  api_key: QhTgdqqJ3XY9DbDuN8NS1+zXUr8NaY83pab4dqgy8Yk=
+  wifi_fallback_pwd: s3box123
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2026.6.5   # required by voip_stack
+  project:
+    name: "KaraDanvers.s3box3"
+    version: "2.1.0"
+  # Apply the saved volume/mic-gain settings on every boot. Generic audio
+  # hardware init only — nothing here touches the voip_stack pipeline.
+  on_boot:
+    priority: 600
+    then:
+      - audio_dac.mute_off: es8311_dac
+      - audio_dac.set_volume:
+          id: es8311_dac
+          volume: !lambda 'return id(speaker_volume) / 100.0;'
+      - audio_adc.set_mic_gain:
+          id: es7210_adc
+          mic_gain: !lambda 'return id(mic_gain_db);'
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+    advanced:
+      execute_from_psram: true
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ${name}
+    password: ${wifi_fallback_pwd}
+  on_connect:
+    - lambda: id(wifi_ok) = true;
+  on_disconnect:
+    - lambda: id(wifi_ok) = false;
+
+captive_portal:
+
+api:
+  encryption:
+    key: ${api_key}
+  on_client_connected:
+    - lambda: id(ha_ok) = true;
+    - voip_stack.update_contacts: phone
+  on_client_disconnected:
+    - lambda: id(ha_ok) = false;
+
+ota:
+  - platform: esphome
+
+esp32_ble_tracker:
+bluetooth_proxy:
+  active: true
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# ── HA-published SIP phonebook ──────────────────────────────────────────
+# The VoIP Stack HA integration publishes the shared roster at
+# sensor.voip_phonebook. voip_stack subscribes to it via
+# ha_phonebook_text_sensor_id (see below) so dialed extensions/names
+# actually resolve instead of failing with "not in local phonebook".
+text_sensor:
+  - platform: homeassistant
+    id: ha_phonebook
+    entity_id: sensor.voip_phonebook
+    attribute: phonebook
+    # voip_stack does NOT auto-consume this sensor's state on change - it
+    # only reads it when voip_stack.update_contacts runs. Fire that here
+    # so every HA phonebook push actually reaches the local phonebook.
+    on_value:
+      - voip_stack.update_contacts: phone
+
+# ── VoIP / Intercom stack ────────────────────────────────────────────────
+# Real component confirmed from the project README. This is the "native
+# ESPHome mic/speaker" path (matches your existing i2s_audio mic/speaker
+# on a shared I2S bus, same as the "Generic S3 (full native)" reference
+# YAML) — no esp_audio_stack / esp_aec needed for this path.
+external_components:
+  - source: github://n-IA-hane/esphome-voip-stack@main
+    components: [voip_stack]
+
+voip_stack:
+  id: phone
+  transport: udp
+  microphone: box_mic
+  speaker: i2s_audio_speaker
+  extension: "101"  # pick any unused SIP extension number for this device
+  ringing_timeout: 30s
+  # Without this, the device has no phonebook to resolve dialed numbers
+  # against ("not in local phonebook and HA peer unavailable"). This binds
+  # the text_sensor below, which subscribes to HA's published SIP roster.
+  ha_phonebook_text_sensor_id: ha_phonebook
+  # RX (incoming/speaker-bound) audio auto-derives sample_rate/format from
+  # the i2s_audio_speaker platform above (48kHz/16-bit/mono). At the
+  # default 16ms frame that RTP payload is 1536 bytes — over the 1200-byte
+  # UDP safe limit. Dropping just frame_ms to 10ms (48000*0.010*2 = 960B)
+  # fixes that without touching sample_rate/bit-depth/channels, which must
+  # stay matched to the native i2s_audio speaker's actual hardware format
+  # since this "native" path (no esp_audio_stack) has no resampler in
+  # between RTP and the speaker.
+  #
+  # TX (outgoing/mic) must be pinned to the SAME frame_ms as RX. The SIP
+  # stack negotiates one shared packet time (ptime) for the whole call —
+  # if tx and rx offer different frame_ms values, the local capability
+  # lists never overlap and INVITE fails immediately with "no shared
+  # TX/RX RTP packet time", before anything is even sent to the peer.
+  # At 16kHz/16-bit/mono, 10ms gives 16000*0.010*2 = 320B, well under
+  # the UDP safe limit, so this doesn't cost anything on the mic side.
+  audio:
+    rx:
+      frame_ms: 10
+    tx:
+      frame_ms: 10
+  on_ringing:
+    - lambda: |-
+        id(call_ringing) = true;
+        id(call_active) = false;
+  on_outgoing_call:
+    - lambda: |-
+        id(call_ringing) = true;
+        id(call_active) = false;
+  on_in_call:
+    - lambda: |-
+        id(call_ringing) = false;
+        id(call_active) = true;
+  on_idle:
+    - lambda: |-
+        id(call_ringing) = false;
+        id(call_active) = false;
+
+# Real auto-answer switch, built into the voip_stack component itself
+# (not a placeholder — this is documented behavior).
+switch:
+  - platform: voip_stack
+    auto_answer:
+      name: "Intercom Auto Answer"
+      restore_mode: RESTORE_DEFAULT_OFF
+      id: auto_answer_switch
+
+  - platform: gpio
+    id: speaker_enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON
+
+  # Speaker mute — plain DAC mute, generic audio hardware control for the
+  # Settings page. Not tied to voip_stack in any way.
+  - platform: template
+    name: "Speaker Mute"
+    id: speaker_mute
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - audio_dac.mute_on: es8311_dac
+    turn_off_action:
+      - audio_dac.mute_off: es8311_dac
+
+# ── I2C (touch controller + audio codecs live on these) ────────────────
+i2c:
+  - id: bus_a
+    sda: GPIO08
+    scl: GPIO18
+    scan: true
+    frequency: 100kHz
+  - id: bus_b
+    sda: GPIO41
+    scl: GPIO40
+    scan: true
+    frequency: 100kHz
+
+# ── Touchscreen (GT911) + physical "red circle" home/back button ───────
+touchscreen:
+  - platform: gt911
+    id: box_touch
+    i2c_id: bus_a
+    interrupt_pin: GPIO3   # verify against your board rev, see note above
+    display: s3_box_lcd
+
+binary_sensor:
+  - platform: gt911
+    name: "Home Button"
+    id: home_button
+    index: 0
+    internal: true
+    on_click:
+      - lambda: |-
+          if (id(current_page) == 1 || id(current_page) == 2) {
+            id(current_page) = 0;
+            id(lvgl_comp)->show_page(id(home_screen)->index, LV_SCR_LOAD_ANIM_NONE, 0);
+          } else if (id(call_active) || id(call_ringing)) {
+            id(phone)->decline_call();
+          }
+
+# ── LCD backlight ────────────────────────────────────────────────────────
+output:
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    id: led
+    name: "LCD Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+# ── Battery ──────────────────────────────────────────────────────────────
+sensor:
+  - platform: adc
+    pin: GPIO10
+    id: battery_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: "voltage"
+    entity_category: "diagnostic"
+    update_interval: 30s
+    attenuation: auto
+    filters:
+      - multiply: 4.11
+
+  - platform: copy
+    id: battery_percent
+    source_id: battery_voltage
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: "battery"
+    entity_category: "diagnostic"
+    filters:
+      - lambda: return (x - 2.7) / (4.2 - 2.7) * 100;
+      - clamp:
+          min_value: 0
+          max_value: 100
+    on_value:
+      - lambda: |-
+          char buf[8];
+          snprintf(buf, sizeof(buf), "%.0f%%", x);
+          lv_label_set_text(id(battery_status_label), buf);
+
+          const char *icon;
+          uint32_t color;
+          if (x >= 60) {
+            icon = "\uF240";   // battery full
+            color = 0x2ECC71;  // green
+          } else if (x >= 30) {
+            icon = "\uF241";   // battery 3/4
+            color = 0xE67E22;  // orange
+          } else if (x >= 16) {
+            icon = "\uF242";   // battery half
+            color = 0xF1C40F;  // yellow
+          } else {
+            icon = "\uF244";   // battery empty
+            color = 0xE74C3C;  // red
+          }
+          lv_label_set_text(id(battery_icon_label), icon);
+          lv_obj_set_style_text_color(id(battery_icon_label), lv_color_hex(color), 0);
+
+# ── Audio hardware: mic + speaker drivers ───────────────────────────────
+# Two i2s_audio bus objects on the SAME physical pins (LRCLK/BCLK/MCLK are
+# shared hardware lines on the S3-Box-3 — one I2S peripheral, mic and
+# speaker just tap different data pins off it). allow_other_uses lets both
+# bus objects claim the same GPIOs without ESPHome treating that as a pin
+# conflict at compile time.
+#
+# The speaker is i2s_mode: primary (it's the clock master — drives BCLK/
+# LRCLK/MCLK continuously) and the mic is i2s_mode: secondary (it slaves to
+# that clock instead of trying to master it independently). Without this
+# split, mic and speaker fight over who owns/drives the shared I2S port,
+# which is what caused "Parent bus is busy" the moment the speaker tried to
+# start mid-call.
+i2s_audio:
+  - id: mic_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO17
+      allow_other_uses: true
+    i2s_mclk_pin:
+      number: GPIO2
+      allow_other_uses: true
+  - id: speaker_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    i2s_bclk_pin:
+      number: GPIO17
+      allow_other_uses: true
+    i2s_mclk_pin:
+      number: GPIO2
+      allow_other_uses: true
+
+audio_adc:
+  - platform: es7210
+    id: es7210_adc
+    i2c_id: bus_a
+    bits_per_sample: 16bit
+    sample_rate: 48000  # matches speaker/RX rate — SDP negotiates ONE shared
+                         # codec set for the call, so a 16kHz-only mic has
+                         # nothing to match once the peer answers at 48kHz
+                         # (was: "SIP SDP rejected ... selected_tx=no")
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: bus_a
+    bits_per_sample: 16bit
+    sample_rate: 48000
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    i2s_audio_id: mic_bus
+    i2s_mode: secondary  # slaves to the speaker's clock — see note above
+    sample_rate: 48000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    channel: right  # this board's ES7210 mic data lands on the right slot
+    adc_type: external
+
+speaker:
+  - id: i2s_audio_speaker
+    platform: i2s_audio
+    i2s_audio_id: speaker_bus
+    i2s_mode: primary  # drives BCLK/LRCLK/MCLK — see note above
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: mono
+    audio_dac: es8311_dac
+    buffer_duration: 100ms
+
+# ── LCD panel ─────────────────────────────────────────────────────────────
+spi:
+  - id: spi_bus
+    clk_pin: 7
+    mosi_pin: 6
+
+display:
+  - platform: mipi_spi
+    id: s3_box_lcd
+    model: S3BOX
+    data_rate: 40MHz
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    color_order: bgr
+    invert_colors: false
+    update_interval: never   # LVGL drives redraws
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_clock
+    size: 28
+  - file: "gfonts://Roboto"
+    id: font_title
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font_label
+    size: 14
+  - file: "gfonts://Roboto"
+    id: font_keypad
+    size: 20
+  - file: "gfonts://Roboto"
+    id: font_buffer
+    size: 22
+  - file: "gfonts://Roboto"
+    id: font_status
+    size: 10
+# Connection/battery status icons use the built-in `montserrat_18` LVGL
+# font (icon glyph subset) directly — no separate font: entry needed for it.
+
+# ── Editable speed dials — shows up under Devices & Services > ESPHome >
+#    (device) > entities in Home Assistant. Rename/repoint anytime.
+#    Values must match a contact name in sensor.voip_phonebook (add
+#    contacts via voip_stack.add_contact or the VoIP Stack integration). ──
+text:
+  - platform: template
+    id: dial1_name
+    name: "Speed Dial 1 Name"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Kitchen"
+  - platform: template
+    id: dial1_target
+    name: "Speed Dial 1 Target"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Kitchen"
+
+  - platform: template
+    id: dial2_name
+    name: "Speed Dial 2 Name"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Living Room"
+  - platform: template
+    id: dial2_target
+    name: "Speed Dial 2 Target"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Living Room"
+
+  - platform: template
+    id: dial3_name
+    name: "Speed Dial 3 Name"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Front Door"
+  - platform: template
+    id: dial3_target
+    name: "Speed Dial 3 Target"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Front Door"
+
+  - platform: template
+    id: dial4_name
+    name: "Speed Dial 4 Name"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Garage"
+  - platform: template
+    id: dial4_target
+    name: "Speed Dial 4 Target"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Garage"
+
+  - platform: template
+    id: dial5_name
+    name: "Speed Dial 5 Name"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Office"
+  - platform: template
+    id: dial5_target
+    name: "Speed Dial 5 Target"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Office"
+
+  - platform: template
+    id: dial6_name
+    name: "Speed Dial 6 Name"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Bedroom"
+  - platform: template
+    id: dial6_target
+    name: "Speed Dial 6 Target"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "Bedroom"
+
+  # Dialer scratchpad (digits/name being typed on the dialer page)
+  - platform: template
+    id: dial_buffer
+    name: "Dialer Buffer"
+    mode: text
+    optimistic: true
+    internal: true
+    initial_value: ""
+
+globals:
+  - id: wifi_ok
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: ha_ok
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: call_ringing
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: call_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: current_page
+    type: int
+    restore_value: false
+    initial_value: "0"   # 0 = home, 1 = dialer, 2 = settings
+  # Mic gain in dB, applied to the ES7210 ADC. restore_value keeps whatever
+  # level you settle on across reboots. Generic audio hardware setting —
+  # not part of the VoIP call pipeline itself.
+  - id: mic_gain_db
+    type: float
+    restore_value: true
+    initial_value: "24.0"
+  # Speaker volume, 0-100. Same idea — generic DAC volume control.
+  - id: speaker_volume
+    type: int
+    restore_value: true
+    initial_value: "80"
+
+script:
+  - id: place_call
+    parameters:
+      dest: string
+    then:
+      - voip_stack.call:
+          id: phone
+          target: !lambda 'return dest;'
+
+# ── LVGL UI ──────────────────────────────────────────────────────────────
+lvgl:
+  id: lvgl_comp
+  displays: s3_box_lcd
+  touchscreens: box_touch
+  bg_color: 0x11151C
+  pages:
+    - id: home_screen
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            id: clock_label
+            align: TOP_MID
+            y: 3
+            text_font: font_clock
+            text_color: 0xFFFFFF
+            text: "--:--"
+
+        # ---- settings gear (top-right corner) ----
+        - button:
+            id: settings_btn
+            align: TOP_RIGHT
+            x: -5
+            y: 3
+            width: 34
+            height: 28
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "\uF013"
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  id(current_page) = 2;
+                  id(lvgl_comp)->show_page(id(settings_screen)->index, LV_SCR_LOAD_ANIM_NONE, 0);
+
+        # ---- speed dial grid (2 rows x 3 cols), sized for the 320x240 panel ----
+        - button:
+            x: 5
+            y: 38
+            width: 100
+            height: 50
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: dial1_btn_label
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Kitchen"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial1_target).state;"
+        - button:
+            x: 110
+            y: 38
+            width: 100
+            height: 50
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: dial2_btn_label
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Living Room"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial2_target).state;"
+        - button:
+            x: 215
+            y: 38
+            width: 100
+            height: 50
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: dial3_btn_label
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Front Door"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial3_target).state;"
+        - button:
+            x: 5
+            y: 93
+            width: 100
+            height: 50
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: dial4_btn_label
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Garage"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial4_target).state;"
+        - button:
+            x: 110
+            y: 93
+            width: 100
+            height: 50
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: dial5_btn_label
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Office"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial5_target).state;"
+        - button:
+            x: 215
+            y: 93
+            width: 100
+            height: 50
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: dial6_btn_label
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Bedroom"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial6_target).state;"
+
+        # ---- dialer button (spans below speed dials) ----
+        - button:
+            x: 5
+            y: 150
+            width: 310
+            height: 40
+            radius: 12
+            bg_color: 0x3D7BFF
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Dial a Number"
+            on_click:
+              - lambda: |-
+                  id(current_page) = 1;
+                  id(lvgl_comp)->show_page(id(dialer_screen)->index, LV_SCR_LOAD_ANIM_NONE, 0);
+
+        # ---- bottom status row: icon-based connection status + battery ----
+        - label:
+            id: phone_status_icon
+            x: 5
+            y: 202
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+            text: "\uF095"
+        - label:
+            id: ha_status_icon
+            x: 40
+            y: 202
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+            text: "\uF015"
+        - label:
+            id: wifi_status_icon
+            x: 75
+            y: 202
+            text_font: montserrat_18
+            text_color: 0xE74C3C
+            text: "\uF1EB"
+        - label:
+            id: mic_status_icon
+            x: 110
+            y: 202
+            text_font: montserrat_18
+            text_color: 0x2ECC71
+            text: "\uF130"
+        - label:
+            id: label_autoanswer_status
+            x: 150
+            y: 208
+            text_font: font_status
+            text_color: 0x7A8699
+            text: "AA:OFF"
+        - label:
+            id: label_call_status
+            x: 190
+            y: 208
+            text_font: font_status
+            text_color: 0xFFC107
+            text: ""
+        - label:
+            id: battery_icon_label
+            x: 258
+            y: 202
+            text_font: montserrat_18
+            text_color: 0xFFFFFF
+            text: "\uF240"
+        - label:
+            id: battery_status_label
+            x: 282
+            y: 208
+            text_font: font_status
+            text_color: 0xFFFFFF
+            text: "--"
+
+    - id: dialer_screen
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            id: dial_buffer_label
+            align: TOP_MID
+            y: 3
+            text_font: font_buffer
+            text_color: 0xFFFFFF
+            text: ""
+
+        # 3x4 keypad, sized to fit the 320x240 panel with a side column
+        # for Call/Clear/Back (keypad occupies x:10-240, y:35-210)
+        - button: {x: 10,  y: 35,  width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "1"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"1\");"}]}
+        - button: {x: 90,  y: 35,  width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "2"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"2\");"}]}
+        - button: {x: 170, y: 35,  width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "3"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"3\");"}]}
+        - button: {x: 10,  y: 80,  width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "4"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"4\");"}]}
+        - button: {x: 90,  y: 80,  width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "5"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"5\");"}]}
+        - button: {x: 170, y: 80,  width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "6"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"6\");"}]}
+        - button: {x: 10,  y: 125, width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "7"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"7\");"}]}
+        - button: {x: 90,  y: 125, width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "8"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"8\");"}]}
+        - button: {x: 170, y: 125, width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "9"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"9\");"}]}
+        - button: {x: 10,  y: 170, width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "*"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"*\");"}]}
+        - button: {x: 90,  y: 170, width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "0"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"0\");"}]}
+        - button: {x: 170, y: 170, width: 70, height: 40, radius: 10, bg_color: 0x1F2632, widgets: [{label: {align: CENTER, text_font: font_keypad, text_color: 0xFFFFFF, text: "#"}}], on_click: [{lambda: "id(dial_buffer).publish_state(id(dial_buffer).state + \"#\");"}]}
+
+        # Call button
+        - button:
+            x: 250
+            y: 35
+            width: 60
+            height: 55
+            radius: 12
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Call"
+            on_click:
+              - script.execute:
+                  id: place_call
+                  dest: !lambda "return id(dial_buffer).state;"
+              - lambda: |-
+                  id(dial_buffer).publish_state("");
+
+        # Clear button
+        - button:
+            x: 250
+            y: 100
+            width: 60
+            height: 45
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Clear"
+            on_click:
+              - lambda: id(dial_buffer).publish_state("");
+
+        # Back button (screen also mirrors the red-circle hardware button)
+        - button:
+            x: 250
+            y: 155
+            width: 60
+            height: 45
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+                  text: "Back"
+            on_click:
+              - lambda: |-
+                  id(current_page) = 0;
+                  id(lvgl_comp)->show_page(id(home_screen)->index, LV_SCR_LOAD_ANIM_NONE, 0);
+
+    # ---- new: Settings page (theme + mic gain / volume / backlight) ----
+    - id: settings_screen
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Settings"
+            align: TOP_MID
+            y: 4
+            text_font: font_title
+            text_color: 0xFFFFFF
+
+        - label:
+            text: "Auto-Answer"
+            x: 10
+            y: 34
+            text_font: font_label
+            text_color: 0xB7C0CC
+        - switch:
+            id: settings_auto_answer_switch
+            x: 250
+            y: 30
+            on_click:
+              - switch.toggle: auto_answer_switch
+
+        - label:
+            text: "Mute Speaker"
+            x: 10
+            y: 64
+            text_font: font_label
+            text_color: 0xB7C0CC
+        - switch:
+            id: settings_mute_switch
+            x: 250
+            y: 60
+            on_click:
+              - switch.toggle: speaker_mute
+
+        - label:
+            text: "Volume"
+            x: 10
+            y: 92
+            text_font: font_label
+            text_color: 0xB7C0CC
+        - slider:
+            id: volume_slider
+            x: 10
+            y: 110
+            width: 300
+            height: 16
+            min_value: 0
+            max_value: 100
+            value: 80
+            bg_color: 0x1F2632
+            indicator:
+              bg_color: 0x3D7BFF
+            knob:
+              bg_color: 0xFFFFFF
+            on_release:
+              - globals.set:
+                  id: speaker_volume
+                  value: !lambda 'return (int) x;'
+              - audio_dac.set_volume:
+                  id: es8311_dac
+                  volume: !lambda 'return x / 100.0;'
+
+        - label:
+            text: "Backlight"
+            x: 10
+            y: 132
+            text_font: font_label
+            text_color: 0xB7C0CC
+        - slider:
+            id: brightness_slider
+            x: 10
+            y: 150
+            width: 300
+            height: 16
+            min_value: 10
+            max_value: 100
+            value: 100
+            bg_color: 0x1F2632
+            indicator:
+              bg_color: 0x3D7BFF
+            knob:
+              bg_color: 0xFFFFFF
+            on_release:
+              - light.turn_on:
+                  id: led
+                  brightness: !lambda 'return x / 100.0;'
+
+        - label:
+            text: "Mic Gain"
+            x: 10
+            y: 176
+            text_font: font_label
+            text_color: 0xB7C0CC
+        - button:
+            id: mic_gain_down_btn
+            x: 10
+            y: 194
+            width: 60
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: {text: "-", align: CENTER, text_font: font_label, text_color: 0xFFFFFF}
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) - 3.0;
+                  if (g < 0.0) g = 0.0;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(mic_gain_label), buf);
+        - label:
+            id: mic_gain_label
+            text: "24.0dB"
+            align: TOP_MID
+            y: 199
+            text_font: font_label
+            text_color: 0xFFFFFF
+        - button:
+            id: mic_gain_up_btn
+            x: 250
+            y: 194
+            width: 60
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label: {text: "+", align: CENTER, text_font: font_label, text_color: 0xFFFFFF}
+            on_click:
+              - lambda: |-
+                  float g = id(mic_gain_db) + 3.0;
+                  if (g > 37.5) g = 37.5;
+                  id(mic_gain_db) = g;
+              - audio_adc.set_mic_gain:
+                  id: es7210_adc
+                  mic_gain: !lambda 'return id(mic_gain_db);'
+              - lambda: |-
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+                  lv_label_set_text(id(mic_gain_label), buf);
+
+        - button:
+            id: back_from_settings_btn
+            align: BOTTOM_MID
+            y: -8
+            width: 140
+            height: 34
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Back"
+                  align: CENTER
+                  text_font: font_label
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  id(current_page) = 0;
+                  id(lvgl_comp)->show_page(id(home_screen)->index, LV_SCR_LOAD_ANIM_NONE, 0);
+
+# ── Periodic UI refresh: clock + status row ─────────────────────────────
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          char buf[6];
+          auto t = id(ha_time).now();
+          if (t.is_valid()) {
+            snprintf(buf, sizeof(buf), "%02d:%02d", t.hour, t.minute);
+            lv_label_set_text(id(clock_label), buf);
+          }
+
+  - interval: 500ms
+    then:
+      - lambda: |-
+          // Icon-based connection status row (same wifi_ok/ha_ok/call_active
+          // logic as before, just drawn as colored icons instead of text).
+          lv_obj_set_style_text_color(id(wifi_status_icon),
+              id(wifi_ok) ? lv_color_hex(0x2ECC71) : lv_color_hex(0xE74C3C), 0);
+          lv_obj_set_style_text_color(id(ha_status_icon),
+              id(ha_ok) ? lv_color_hex(0x2ECC71) : lv_color_hex(0xE74C3C), 0);
+          lv_obj_set_style_text_color(id(phone_status_icon),
+              (id(wifi_ok) && id(ha_ok)) ? lv_color_hex(0x2ECC71) : lv_color_hex(0xE74C3C), 0);
+          lv_obj_set_style_text_color(id(mic_status_icon),
+              id(call_active) ? lv_color_hex(0xE74C3C) : lv_color_hex(0x2ECC71), 0);
+          lv_label_set_text(id(label_autoanswer_status),
+              id(auto_answer_switch).state ? "AA:ON" : "AA:OFF");
+          lv_obj_set_style_text_color(id(label_autoanswer_status),
+              id(auto_answer_switch).state ? lv_color_hex(0x2ECC71) : lv_color_hex(0x7A8699), 0);
+          if (id(call_ringing)) {
+            lv_label_set_text(id(label_call_status), "Ringing");
+          } else if (id(call_active)) {
+            lv_label_set_text(id(label_call_status), "In Call");
+          } else {
+            lv_label_set_text(id(label_call_status), "");
+          }
+          // Keep the Settings page switches reflecting the real entity state.
+          if (id(auto_answer_switch).state) {
+            lv_obj_add_state(id(settings_auto_answer_switch), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(settings_auto_answer_switch), LV_STATE_CHECKED);
+          }
+          if (id(speaker_mute).state) {
+            lv_obj_add_state(id(settings_mute_switch), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(settings_mute_switch), LV_STATE_CHECKED);
+          }
+
+  # Keep speed-dial button labels + dialer buffer in sync live
+  - interval: 2s
+    then:
+      - lambda: |-
+          lv_label_set_text(id(dial1_btn_label), id(dial1_name).state.c_str());
+          lv_label_set_text(id(dial2_btn_label), id(dial2_name).state.c_str());
+          lv_label_set_text(id(dial3_btn_label), id(dial3_name).state.c_str());
+          lv_label_set_text(id(dial4_btn_label), id(dial4_name).state.c_str());
+          lv_label_set_text(id(dial5_btn_label), id(dial5_name).state.c_str());
+          lv_label_set_text(id(dial6_btn_label), id(dial6_name).state.c_str());
+          lv_label_set_text(id(dial_buffer_label), id(dial_buffer).state.c_str());

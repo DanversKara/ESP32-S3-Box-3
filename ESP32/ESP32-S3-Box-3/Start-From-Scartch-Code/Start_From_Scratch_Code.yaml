@@ -1,0 +1,216 @@
+########################################################################
+# ESP32-S3-Box-3 — BASE / BOOTSTRAP CONFIG
+#
+# Everything from the old config has been removed. What's left is just
+# enough to prove every piece of hardware works, plus your connection
+# info so you don't have to re-enter it:
+#
+#   - Battery voltage/percent reading
+#   - USB (serial logging over USB_SERIAL_JTAG, used for flashing/logs)
+#   - LCD driver + LCD backlight (the "LED")
+#   - Speaker driver (I2S/ES8311)
+#   - Mic driver (I2S/ES7210)
+#   - WiFi (connects to your network + falls back to an AP if it can't)
+#   - Bluetooth (proxied to Home Assistant)
+#   - Home Assistant API connection (uses your saved api_key)
+#
+# On boot it just draws "READY" on the screen. Once you see that, every
+# driver above initialized without errors and you're clear to build on
+# top of this file.
+########################################################################
+
+substitutions:
+  name: esp32-s3box-3
+  friendly_name: ESP32-S3-Box-3
+
+  # ── Saved connection info / secrets — carried over from the old config ──
+  external_media_player: living_room_speaker   # entity_id suffix, no "media_player." prefix
+  home_assistant_host: http://192.168.8.162:8123
+  api_key: QhTgdqqJ3XY9DbDuN8NS1+zXUr8NaY83pab4dqgy8Yk=
+  wifi_fallback_pwd: s3box123                  # password for the fallback AP if WiFi fails
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  min_version: 2026.4.0
+  project:
+    name: "Christian.s3box3"
+    version: "1.0.0"
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+    advanced:
+      execute_from_psram: true
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# ── USB / logging ───────────────────────────────────────────────────────
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+# ── WiFi + fallback AP ──────────────────────────────────────────────────
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ${name}
+    password: ${wifi_fallback_pwd}
+
+captive_portal:
+
+# ── Home Assistant API ──────────────────────────────────────────────────
+api:
+  encryption:
+    key: ${api_key}
+
+ota:
+  - platform: esphome
+
+# ── Bluetooth (shows up as a BT proxy in Home Assistant) ───────────────
+esp32_ble_tracker:
+bluetooth_proxy:
+  active: true
+
+# ── I2C (touch controller + audio codecs live on these) ────────────────
+i2c:
+  - id: bus_a
+    sda: GPIO08
+    scl: GPIO18
+    scan: true
+    frequency: 100kHz
+  - id: bus_b
+    sda: GPIO41
+    scl: GPIO40
+    scan: true
+    frequency: 100kHz
+
+# ── LCD backlight ("the LED") ───────────────────────────────────────────
+output:
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    id: led
+    name: "LCD Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+# ── Battery ──────────────────────────────────────────────────────────────
+sensor:
+  - platform: adc
+    pin: GPIO10
+    id: battery_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: "voltage"
+    entity_category: "diagnostic"
+    update_interval: 30s
+    attenuation: auto
+    filters:
+      - multiply: 4.11
+
+  - platform: copy
+    id: battery_percent
+    source_id: battery_voltage
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: "battery"
+    entity_category: "diagnostic"
+    filters:
+      - lambda: return (x - 2.7) / (4.2 - 2.7) * 100;
+      - clamp:
+          min_value: 0
+          max_value: 100
+
+# ── Audio hardware: mic + speaker drivers ───────────────────────────────
+i2s_audio:
+  - id: audio_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+audio_adc:
+  - platform: es7210
+    id: es7210_adc
+    i2c_id: bus_a
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: bus_a
+    bits_per_sample: 16bit
+    sample_rate: 48000
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    sample_rate: 16000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    adc_type: external
+
+switch:
+  - platform: gpio
+    id: speaker_enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_ON   # amp powered so the speaker driver is live/testable
+
+speaker:
+  - id: i2s_audio_speaker
+    platform: i2s_audio
+    i2s_audio_id: audio_bus
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: mono
+    audio_dac: es8311_dac
+    buffer_duration: 100ms
+
+# ── LCD panel + "READY" screen ──────────────────────────────────────────
+spi:
+  - id: spi_bus
+    clk_pin: 7
+    mosi_pin: 6
+
+font:
+  - file: "gfonts://Roboto"
+    id: ready_font
+    size: 48
+
+display:
+  - platform: mipi_spi
+    id: s3_box_lcd
+    model: S3BOX
+    data_rate: 40MHz
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    color_order: bgr
+    invert_colors: false
+    lambda: |-
+      it.fill(Color::BLACK);
+      it.print(it.get_width() / 2, it.get_height() / 2, id(ready_font),
+               Color::WHITE, TextAlign::CENTER, "READY");
