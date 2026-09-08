@@ -322,16 +322,17 @@ light:
 
   - platform: monochromatic
     id: led
-    name: "LCD Backlight"
+    name: "Display - LCD Backlight"
     output: backlight_output
     restore_mode: ALWAYS_ON
 
 number:
 
   - platform: template
-    name: "Banner Height"
+    name: "Display - Banner Height"
     id: banner_height_num
     icon: "mdi:arrow-expand-vertical"
+    entity_category: CONFIG
     unit_of_measurement: "px"
     min_value: 20
     max_value: 290
@@ -352,9 +353,10 @@ number:
           int h = requested > max_reachable ? max_reachable : requested;
           lv_obj_set_height(id(availability_banner), h);
   - platform: template
-    name: "Banner Width"
+    name: "Display - Banner Width"
     id: banner_width_num
     icon: "mdi:arrow-expand-horizontal"
+    entity_category: CONFIG
     unit_of_measurement: "%"
     min_value: 50
     max_value: 100
@@ -366,9 +368,10 @@ number:
       - lambda: |-
           lv_obj_set_width(id(availability_banner), lv_pct((int) x));
   - platform: template
-    name: "Banner Background Opacity"
+    name: "Display - Banner Background Opacity"
     id: banner_bg_opacity_num
     icon: "mdi:opacity"
+    entity_category: CONFIG
     unit_of_measurement: "%"
     min_value: 0
     max_value: 100
@@ -379,6 +382,50 @@ number:
     on_value:
       - lambda: |-
           lv_obj_set_style_bg_opa(id(availability_banner), (lv_opa_t) ((x / 100.0) * 255), 0);
+  - platform: template
+    name: "Audio - Speaker Volume"
+    id: speaker_volume_num
+    icon: "mdi:volume-high"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 70
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          id(volume_percent) = (int) x;
+      - audio_dac.set_volume:
+          id: es8311_dac
+          volume: !lambda 'return id(volume_percent) / 100.0;'
+      - lambda: |-
+          char buf[8];
+          snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
+          lv_label_set_text(id(volume_percent_label), buf);
+          lv_label_set_text(id(incall_speaker_vol_label), buf);
+  - platform: template
+    name: "Audio - Mic Gain"
+    id: mic_gain_num
+    icon: "mdi:microphone"
+    unit_of_measurement: "dB"
+    min_value: 0
+    max_value: 37.5
+    step: 3
+    initial_value: 24
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          id(mic_gain_db) = (float) x;
+      - audio_adc.set_mic_gain:
+          id: es7210_adc
+          mic_gain: !lambda 'return id(mic_gain_db);'
+      - lambda: |-
+          char buf[12];
+          snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
+          lv_label_set_text(id(mic_gain_label), buf);
+          lv_label_set_text(id(incall_mic_gain_label), buf);
 
 sensor:
   - platform: adc
@@ -395,10 +442,11 @@ sensor:
   - platform: copy
     id: battery_percent
     source_id: battery_voltage
-    name: "Battery Level"
+    name: "System - Battery Level"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     device_class: "battery"
+    entity_category: "diagnostic"
     entity_category: "diagnostic"
     filters:
       - lambda: return (x - 2.7) / (4.2 - 2.7) * 100;
@@ -490,13 +538,17 @@ rtttl:
 
 button:
   - platform: template
-    name: "Test Ringtone"
+    name: "System - Test Ringtone"
     entity_category: diagnostic
     on_press:
       - logger.log: "rtttl: manual test triggered"
       - rtttl.play:
           id: ringtone
           rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
+  - platform: restart
+    name: "System - Restart"
+    entity_category: CONFIG
+    icon: "mdi:restart"
 
 script:
   - id: apply_screen_rotation
@@ -796,9 +848,11 @@ script:
               id(dnd_switch).turn_off();
               id(banner_height_num).make_call().set_value(35).perform();
             } else if (!available && id(schedule_was_available)) {
-              // Just crossed Available Until.
-              id(dnd_switch).turn_on();
-              id(banner_height_num).make_call().set_value(290).perform();
+              // Just crossed Available Until. Do Not Disturb stays off and
+              // the doorbell press button stays visible - just show the
+              // After Hours message in a smaller banner until we cross
+              // Available From again.
+              id(banner_height_num).make_call().set_value(50).perform();
               id(banner_width_num).make_call().set_value(95).perform();
             }
           }
@@ -999,7 +1053,7 @@ binary_sensor:
       inverted: true
       # NOTE: ignore_strapping_warning removed because GPIO1 is NOT a strapping pin
     id: hw_mute_switch
-    name: "Mic Mute Switch"
+    name: "System - Mic Mute Switch (Hardware)"
     entity_category: diagnostic
     on_state:
       then:
@@ -1012,7 +1066,8 @@ binary_sensor:
               - logger.log: "Hardware mute released"
 
   - platform: gt911
-    name: "Home Button"
+    name: "System - Home Button"
+    entity_category: diagnostic
     index: 0
     on_press:
       if:
@@ -2295,18 +2350,7 @@ lvgl:
             widgets:
               - label: { text: "-", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
             on_click:
-              - lambda: |-
-                  int v = id(volume_percent) - 5;
-                  if (v < 0) v = 0;
-                  id(volume_percent) = v;
-              - audio_dac.set_volume:
-                  id: es8311_dac
-                  volume: !lambda 'return id(volume_percent) / 100.0;'
-              - lambda: |-
-                  char buf[8];
-                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
-                  lv_label_set_text(id(incall_speaker_vol_label), buf);
-                  lv_label_set_text(id(volume_percent_label), buf);
+              - number.decrement: speaker_volume_num
         - label:
             id: incall_speaker_vol_label
             text: "85%"
@@ -2325,18 +2369,7 @@ lvgl:
             widgets:
               - label: { text: "+", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
             on_click:
-              - lambda: |-
-                  int v = id(volume_percent) + 5;
-                  if (v > 100) v = 100;
-                  id(volume_percent) = v;
-              - audio_dac.set_volume:
-                  id: es8311_dac
-                  volume: !lambda 'return id(volume_percent) / 100.0;'
-              - lambda: |-
-                  char buf[8];
-                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
-                  lv_label_set_text(id(incall_speaker_vol_label), buf);
-                  lv_label_set_text(id(volume_percent_label), buf);
+              - number.increment: speaker_volume_num
         - label:
             text: "MIC LEVEL:"
             text_font: font_medium_bold
@@ -2354,18 +2387,7 @@ lvgl:
             widgets:
               - label: { text: "-", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
             on_click:
-              - lambda: |-
-                  float g = id(mic_gain_db) - 3.0;
-                  if (g < 0.0) g = 0.0;
-                  id(mic_gain_db) = g;
-              - audio_adc.set_mic_gain:
-                  id: es7210_adc
-                  mic_gain: !lambda 'return id(mic_gain_db);'
-              - lambda: |-
-                  char buf[12];
-                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
-                  lv_label_set_text(id(incall_mic_gain_label), buf);
-                  lv_label_set_text(id(mic_gain_label), buf);
+              - number.decrement: mic_gain_num
         - label:
             id: incall_mic_gain_label
             text: "24.0dB"
@@ -2384,18 +2406,7 @@ lvgl:
             widgets:
               - label: { text: "+", align: CENTER, text_font: font_large_bold, text_color: 0xFFFFFF }
             on_click:
-              - lambda: |-
-                  float g = id(mic_gain_db) + 3.0;
-                  if (g > 37.5) g = 37.5;
-                  id(mic_gain_db) = g;
-              - audio_adc.set_mic_gain:
-                  id: es7210_adc
-                  mic_gain: !lambda 'return id(mic_gain_db);'
-              - lambda: |-
-                  char buf[12];
-                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
-                  lv_label_set_text(id(incall_mic_gain_label), buf);
-                  lv_label_set_text(id(mic_gain_label), buf);
+              - number.increment: mic_gain_num
         - label:
             id: call_timer_label
             text: "00:00"
@@ -2501,17 +2512,7 @@ lvgl:
             widgets:
               - label: { text: "-", align: CENTER, text_font: font_medium }
             on_click:
-              - lambda: |-
-                  int v = id(volume_percent) - 5;
-                  if (v < 0) v = 0;
-                  id(volume_percent) = v;
-              - audio_dac.set_volume:
-                  id: es8311_dac
-                  volume: !lambda 'return id(volume_percent) / 100.0;'
-              - lambda: |-
-                  char buf[8];
-                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
-                  lv_label_set_text(id(volume_percent_label), buf);
+              - number.decrement: speaker_volume_num
         - label:
             id: volume_percent_label
             text: "70%"
@@ -2531,17 +2532,7 @@ lvgl:
             widgets:
               - label: { text: "+", align: CENTER, text_font: font_medium }
             on_click:
-              - lambda: |-
-                  int v = id(volume_percent) + 5;
-                  if (v > 100) v = 100;
-                  id(volume_percent) = v;
-              - audio_dac.set_volume:
-                  id: es8311_dac
-                  volume: !lambda 'return id(volume_percent) / 100.0;'
-              - lambda: |-
-                  char buf[8];
-                  snprintf(buf, sizeof(buf), "%d%%", id(volume_percent));
-                  lv_label_set_text(id(volume_percent_label), buf);
+              - number.increment: speaker_volume_num
         - label:
             text: "Mic Gain"
             text_font: font_small
@@ -2559,18 +2550,7 @@ lvgl:
             widgets:
               - label: { text: "-", align: CENTER, text_font: font_medium }
             on_click:
-              - lambda: |-
-                  float g = id(mic_gain_db) - 3.0;
-                  if (g < 0.0) g = 0.0;
-                  id(mic_gain_db) = g;
-              - audio_adc.set_mic_gain:
-                  id: es7210_adc
-                  mic_gain: !lambda 'return id(mic_gain_db);'
-              - lambda: |-
-                  char buf[12];
-                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
-                  lv_label_set_text(id(mic_gain_label), buf);
-                  lv_label_set_text(id(incall_mic_gain_label), buf);
+              - number.decrement: mic_gain_num
         - label:
             id: mic_gain_label
             text: "24.0dB"
@@ -2590,18 +2570,7 @@ lvgl:
             widgets:
               - label: { text: "+", align: CENTER, text_font: font_medium }
             on_click:
-              - lambda: |-
-                  float g = id(mic_gain_db) + 3.0;
-                  if (g > 37.5) g = 37.5;
-                  id(mic_gain_db) = g;
-              - audio_adc.set_mic_gain:
-                  id: es7210_adc
-                  mic_gain: !lambda 'return id(mic_gain_db);'
-              - lambda: |-
-                  char buf[12];
-                  snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
-                  lv_label_set_text(id(mic_gain_label), buf);
-                  lv_label_set_text(id(incall_mic_gain_label), buf);
+              - number.increment: mic_gain_num
 
     - id: lcd_brightness_page
       bg_color: 0x11151C
@@ -2650,9 +2619,10 @@ lvgl:
 
 text:
   - platform: template
-    name: "Caption - Apt/Unit"
+    name: "Door - Caption (Apt/Unit)"
     id: door_caption_message
     icon: "mdi:card-text-outline"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2662,9 +2632,10 @@ text:
       - lambda: |-
           lv_label_set_text(id(doorbell_caption_label), id(door_caption_message).state.c_str());
   - platform: template
-    name: "Message - Available"
+    name: "Door - Message (Available)"
     id: available_message
     icon: "mdi:message-text"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2673,9 +2644,10 @@ text:
     on_value:
       - script.execute: apply_availability_status
   - platform: template
-    name: "Message - After Hours"
+    name: "Door - Message (After Hours)"
     id: unavailable_message
     icon: "mdi:message-text-outline"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2684,9 +2656,10 @@ text:
     on_value:
       - script.execute: apply_availability_status
   - platform: template
-    name: "Message - Police Mode"
+    name: "Door - Message (Police Mode)"
     id: police_mode_message
     icon: "mdi:police-badge"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2695,9 +2668,10 @@ text:
     on_value:
       - script.execute: apply_special_mode
   - platform: template
-    name: "Message - No Soliciting"
+    name: "Door - Message (No Soliciting)"
     id: no_soliciting_message
     icon: "mdi:cancel"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2706,9 +2680,10 @@ text:
     on_value:
       - script.execute: apply_special_mode
   - platform: template
-    name: "Label - Police Mode"
+    name: "Door - Label (Police Mode)"
     id: police_mode_label
     icon: "mdi:police-badge"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2717,9 +2692,10 @@ text:
     on_value:
       - script.execute: apply_special_mode
   - platform: template
-    name: "Label - No Soliciting"
+    name: "Door - Label (No Soliciting)"
     id: no_soliciting_label
     icon: "mdi:cancel"
+    entity_category: CONFIG
     mode: text
     optimistic: true
     restore_value: true
@@ -2731,9 +2707,10 @@ text:
 datetime:
   - platform: template
     type: time
-    name: "Available From"
+    name: "Door - Available From"
     id: available_from
     icon: "mdi:clock-start"
+    entity_category: CONFIG
     optimistic: true
     restore_value: true
     initial_value: "09:00:00"
@@ -2743,9 +2720,10 @@ datetime:
       - script.execute: apply_availability_status
   - platform: template
     type: time
-    name: "Available Until"
+    name: "Door - Available Until"
     id: available_until
     icon: "mdi:clock-end"
+    entity_category: CONFIG
     optimistic: true
     restore_value: true
     initial_value: "22:00:00"
@@ -2756,7 +2734,7 @@ datetime:
 
 select:
   - platform: template
-    name: "Screen Rotation"
+    name: "Display - Screen Rotation"
     id: screen_rotation_select
     icon: "mdi:screen-rotation"
     entity_category: CONFIG
@@ -2779,7 +2757,7 @@ select:
 
 switch:
   - platform: template
-    name: "Speaker Mute"
+    name: "Audio - Speaker Mute"
     id: speaker_mute
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
@@ -2796,7 +2774,7 @@ switch:
           state:
             checked: false
   - platform: template
-    name: "Do Not Disturb"
+    name: "Door - Do Not Disturb"
     id: dnd_switch
     icon: "mdi:bell-cancel-outline"
     optimistic: true
@@ -2814,7 +2792,7 @@ switch:
       - lambda: |-
           lv_obj_clear_flag(id(doorbell_icon_btn), LV_OBJ_FLAG_HIDDEN);
   - platform: template
-    name: "Police Mode"
+    name: "Door - Police Mode"
     id: police_mode_switch
     icon: "mdi:police-badge"
     optimistic: true
@@ -2835,7 +2813,7 @@ switch:
           value: 'false'
       - script.execute: apply_special_mode
   - platform: template
-    name: "No Soliciting Mode"
+    name: "Door - No Soliciting Mode"
     id: no_soliciting_switch
     icon: "mdi:cancel"
     optimistic: true
@@ -2856,7 +2834,7 @@ switch:
           value: 'false'
       - script.execute: apply_special_mode
   - platform: template
-    name: "Intercom Auto Answer"
+    name: "Audio - Auto Answer"
     id: voip_auto_answer
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
