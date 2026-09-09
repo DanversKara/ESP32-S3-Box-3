@@ -41,7 +41,7 @@ esphome:
       - audio_dac.mute_off: es8311_dac
       - audio_dac.set_volume:
           id: es8311_dac
-          volume: 85%
+          volume: 90%
       - audio_adc.set_mic_gain:
           id: es7210_adc
           mic_gain: !lambda 'return id(mic_gain_db);'
@@ -78,7 +78,7 @@ wifi:
     - delay: 2s
     - audio_dac.set_volume:
         id: es8311_dac
-        volume: 85%
+        volume: 90%
     - audio_dac.mute_off: es8311_dac
     - globals.set:
         id: wifi_connected
@@ -401,7 +401,7 @@ number:
     min_value: 0
     max_value: 100
     step: 5
-    initial_value: 70
+    initial_value: 90
     optimistic: true
     restore_value: true
     on_value:
@@ -907,9 +907,9 @@ script:
                 id: call_seconds
                 value: '0'
             - lambda: |-
-                lv_label_set_text(id(incall_status_label), "RINGING RESIDENCE...");
+                lv_label_set_text(id(incall_status_label), "CALLING RESIDENCE");
                 lv_label_set_text(id(call_timer_label), "00:00");
-                lv_label_set_text(id(answer_btn_label), "CANCEL");
+                lv_label_set_text(id(answer_btn_label), "END CALL");
                 lv_obj_set_style_bg_color(id(answer_btn), lv_color_hex(0xE74C3C), 0);
                 char buf[12];
                 snprintf(buf, sizeof(buf), "%.1fdB", id(mic_gain_db));
@@ -953,7 +953,7 @@ script:
             if (available && !id(schedule_was_available)) {
               // Just crossed Available From.
               id(dnd_switch).turn_off();
-              id(banner_height_num).make_call().set_value(35).perform();
+              id(banner_height_num).make_call().set_value(50).perform();
             } else if (!available && id(schedule_was_available)) {
               // Just crossed Available Until. Do Not Disturb stays off and
               // the doorbell press button stays visible - just show the
@@ -1655,14 +1655,14 @@ lvgl:
                   text_opa: 35%
               - label:
                   id: doorbell_press_label
-                  text: "PRESS"
+                  text: "CALL US"
                   align: CENTER
                   y: -18
                   text_font: font_medium_bold
                   text_color: 0xFFFFFF
               - label:
                   id: doorbell_enter_label
-                  text: "HERE"
+                  text: "PRESS HERE"
                   align: CENTER
                   y: 14
                   text_font: font_medium_bold
@@ -1681,7 +1681,7 @@ lvgl:
             border_width: 0
         - label:
             id: doorbell_caption_label
-            text: "APT 666"
+            text: "This is - APT 666"
             text_font: font_medium_bold
             text_color: 0xFFFFFF
             text_align: CENTER
@@ -2833,8 +2833,8 @@ text:
     mode: text
     optimistic: true
     restore_value: true
-    initial_value: "APT 666"
-    max_length: 20
+    initial_value: "This is - APT 666"
+    max_length: 60
     on_value:
       - lambda: |-
           lv_label_set_text(id(doorbell_caption_label), id(door_caption_message).state.c_str());
@@ -2846,8 +2846,8 @@ text:
     mode: text
     optimistic: true
     restore_value: true
-    initial_value: "We're here — ring the bell!"
-    max_length: 40
+    initial_value: "We're Available 9AM/8PM Call US ^"
+    max_length: 60
     on_value:
       - script.execute: apply_availability_status
   - platform: template
