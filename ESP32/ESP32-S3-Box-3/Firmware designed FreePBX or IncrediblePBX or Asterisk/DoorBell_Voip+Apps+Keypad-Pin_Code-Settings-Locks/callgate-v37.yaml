@@ -9,6 +9,10 @@ substitutions:
   settings_pin: !secret settings_pin
   door_pin: !secret door_pin
   doorbell_extension: "601"
+  # The HA entity_id called to lock/unlock the door (lock icon double-tap,
+  # PIN keypad, and the Settings page "Unlock Door" button all share this -
+  # see unlock_door_via_ha in the `script:` block). Edit this value and
+  # reflash to point it at a different helper script.
   door_lock_script_entity: script.toggle_front_door_lock
 
 external_components:
@@ -81,6 +85,7 @@ wifi:
         value: 'true'
     - script.execute: apply_dialpad_status
     - script.execute: apply_wifi_status
+    - script.execute: apply_home_theme
   on_disconnect:
     - globals.set:
         id: wifi_connected
@@ -146,6 +151,12 @@ api:
 
 ota:
   platform: esphome
+
+# Needed so the "URL Photo" home-screen theme can download an image over
+# HTTP(S) at runtime (see the online_image entry under `image:` below).
+http_request:
+  verify_ssl: false
+  timeout: 15s
 
 time:
   platform: sntp
@@ -447,7 +458,6 @@ sensor:
     accuracy_decimals: 0
     device_class: "battery"
     entity_category: "diagnostic"
-    entity_category: "diagnostic"
     filters:
       - lambda: return (x - 2.7) / (4.2 - 2.7) * 100;
       - clamp:
@@ -569,6 +579,90 @@ script:
       - script.execute: apply_incall_layout
       - script.execute: apply_audio_mic_layout
       - script.execute: apply_lcd_brightness_layout
+      - lvgl.widget.update:
+          id: theme_photo_img
+
+  # Switches the home-screen background between the animated "Matrix" rain
+  # and a user-supplied photo, based on the "Display - Theme" select entity
+  # in Home Assistant. Also (re)triggers the photo download when needed.
+  # The photo image widget is width:100%/height:100% so it automatically
+  # re-fits whatever the current screen rotation/size is - no extra math
+  # needed here.
+  - id: apply_home_theme
+    then:
+      - if:
+          condition:
+            # index 1 = "URL Photo" per the options: list on home_theme_select
+            # below. Deliberately NOT using id(home_theme_select).state here -
+            # ESPHome 2026.7+ generates a template select variant that hides
+            # the inherited .state field when a set_action is present; the
+            # active_index() function still works fine.
+            lambda: 'return id(home_theme_select).active_index().value_or(0) == 1;'
+          then:
+            - lambda: |-
+                lv_obj_add_flag(id(matrix_col_0), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_1), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_2), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_3), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_4), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_5), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_6), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_7), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_8), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_9), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_10), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(matrix_col_11), LV_OBJ_FLAG_HIDDEN);
+            - if:
+                condition:
+                  lambda: 'return id(theme_photo_url).state.length() > 0;'
+                then:
+                  - if:
+                      # Skip the redownload when we already have a good,
+                      # currently-decoded photo for this exact URL - this is
+                      # what happens when "URL Photo" is re-selected while
+                      # already active (e.g. a re-triggered automation), and
+                      # unconditionally redownloading here is what let a
+                      # one-off network blip blank an otherwise-fine screen.
+                      condition:
+                        lambda: |-
+                          return id(theme_photo_load_ok) &&
+                                 id(theme_photo_loaded_url) == id(theme_photo_url).state;
+                      then:
+                        - lvgl.widget.update:
+                            id: theme_photo_img
+                        - lambda: |-
+                            lv_obj_clear_flag(id(theme_photo_img), LV_OBJ_FLAG_HIDDEN);
+                        - lvgl.widget.update:
+                            id: theme_photo_img
+                        - logger.log: "Theme: 'URL Photo' re-selected with an unchanged URL and a photo already loaded - skipping redundant redownload."
+                      else:
+                        # Keep the photo widget hidden until
+                        # on_download_finished confirms the new buffer is
+                        # fully decoded and stable - showing it mid-download
+                        # risks LVGL trying to draw a buffer that's being
+                        # swapped out from under it.
+                        - lambda: |-
+                            lv_obj_add_flag(id(theme_photo_img), LV_OBJ_FLAG_HIDDEN);
+                        - online_image.set_url:
+                            id: theme_photo_image
+                            url: !lambda 'return id(theme_photo_url).state;'
+                else:
+                  - logger.log: "Theme: 'URL Photo' selected but no photo URL is set yet."
+          else:
+            - lambda: |-
+                lv_obj_clear_flag(id(matrix_col_0), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_1), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_2), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_3), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_4), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_5), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_6), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_7), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_8), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_9), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_10), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_flag(id(matrix_col_11), LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_flag(id(theme_photo_img), LV_OBJ_FLAG_HIDDEN);
 
   - id: apply_dialpad_layout
     then:
@@ -735,6 +829,35 @@ script:
             lv_obj_set_style_bg_opa(id(settings_btn), (lv_opa_t) 255, 0);
           }
 
+  # Shared by all three places that can trigger a lock toggle (lock icon
+  # double-tap, the door's PIN keypad, and the Settings page "Unlock Door"
+  # button) - previously each had its own copy-pasted api.connected guard +
+  # homeassistant.service call + error logging. Consolidated here so a
+  # future change (e.g. adding a retry, or logging to a different tag)
+  # only needs to happen in one place.
+  # The target HA entity_id is set via the `door_lock_script_entity`
+  # substitution at the top of this file - edit it there and reflash if you
+  # need to point this at a different helper script.
+  - id: unlock_door_via_ha
+    then:
+      - if:
+          condition:
+            api.connected: {}
+          then:
+            - homeassistant.service:
+                service: script.turn_on
+                data:
+                  entity_id: "${door_lock_script_entity}"
+                on_error:
+                  - logger.log:
+                      format: "HA service error (script.turn_on door lock): %s"
+                      args: ["error.c_str()"]
+                      tag: ha_service
+          else:
+            - logger.log:
+                format: "Skipped HA service call: no API connection"
+                tag: ha_service
+
   - id: lock_icon_single_tap_action
     mode: restart
     then:
@@ -747,23 +870,7 @@ script:
           condition:
             lambda: 'return id(door_alarm_door).state;'
           then:
-            - if:
-                condition:
-                  api.connected: {}
-                then:
-                  - homeassistant.service:
-                      service: script.turn_on
-                      data:
-                        entity_id: ${door_lock_script_entity}
-                      on_error:
-                        - logger.log:
-                            format: "HA service error (script.turn_on door lock via single-tap): %s"
-                            args: ["error.c_str()"]
-                            tag: ha_service
-                else:
-                  - logger.log:
-                      format: "Skipped HA service call: no API connection"
-                      tag: ha_service
+            - script.execute: unlock_door_via_ha
           else:
             - globals.set:
                 id: pin_buffer
@@ -1039,9 +1146,16 @@ binary_sensor:
         then:
           - sip_client.hangup: phone
 
+  # This points at binary_sensor.callgate_door_state, a Template Binary
+  # Sensor helper created in Home Assistant (Settings > Devices & Services
+  # > Helpers), rather than directly at the physical contact sensor. The
+  # helper's own template decides which real sensor to read from, and that
+  # template is editable anytime in the HA UI. So swapping/replacing the
+  # physical door sensor in the future is a one-line edit to the helper in
+  # HA - this line, and this file, should never need to change again.
   - platform: homeassistant
     id: door_alarm_door
-    entity_id: binary_sensor.contact_sensor_door
+    entity_id: binary_sensor.callgate_door_state
     on_state:
       then:
         - script.execute: apply_door_lock_icon
@@ -1214,6 +1328,28 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  - id: theme_photo_w
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: theme_photo_h
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Tracks whether theme_photo_image currently holds a successfully
+  # decoded, on-screen-worthy buffer, and which URL it came from. Used by
+  # apply_home_theme to skip redundant redownloads when "URL Photo" is
+  # re-selected with an unchanged URL, and by on_error to avoid blanking
+  # the screen on a transient download failure when a good photo is
+  # already loaded.
+  - id: theme_photo_load_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: theme_photo_loaded_url
+    type: std::string
+    restore_value: false
+    initial_value: '""'
   - id: schedule_was_available
     type: bool
     restore_value: false
@@ -1234,6 +1370,72 @@ globals:
     type: bool
     restore_value: true
     initial_value: 'false'
+
+# Downloaded at runtime for the "URL Photo" home-screen theme (see the
+# "Display - Theme" select and "Display - Theme Photo URL" text entities in
+# Home Assistant, and the apply_home_theme script above).
+# - format is JPEG since that's what most phone photos / HA media are. If
+#   your image is a .png, change format to PNG. Only baseline JPEG is
+#   supported - progressive JPEGs will fail to decode (re-save/re-export
+#   the photo without "progressive" if you hit that error).
+# - resize bounds the decoded image to at most 320x320 (preserving its own
+#   aspect ratio) - just keeps RAM/decode cost sane, it does NOT need to
+#   match the screen's aspect ratio. The LVGL image widget below is 100%
+#   width/height with a runtime-computed transform_zoom that scales the
+#   photo up to fully COVER the current screen (cropping the overflow)
+#   rather than letterboxing it, and re-fits automatically on rotation
+#   changes.
+# - update_interval is "never": the photo only (re)downloads when you pick
+#   "URL Photo" or change the URL. Set it to e.g. 1h if you want it to
+#   auto-refresh (handy if the URL points at a live camera snapshot).
+image:
+  - platform: online_image
+    id: theme_photo_image
+    url: "https://example.com/photo.jpg" # placeholder - replaced at runtime via the HA text entity
+    format: JPEG
+    type: RGB565
+    resize: 320x320
+    update_interval: never
+    on_download_finished:
+      - lambda: |-
+          id(theme_photo_w) = id(theme_photo_image).get_width();
+          id(theme_photo_h) = id(theme_photo_image).get_height();
+      - lvgl.image.update:
+          id: theme_photo_img
+          src: theme_photo_image
+      - lvgl.widget.update:
+          id: theme_photo_img
+      - if:
+          condition:
+            lambda: 'return id(home_theme_select).active_index().value_or(0) == 1;'
+          then:
+            - lambda: |-
+                lv_obj_clear_flag(id(theme_photo_img), LV_OBJ_FLAG_HIDDEN);
+      - lambda: |-
+          id(theme_photo_load_ok) = true;
+          id(theme_photo_loaded_url) = id(theme_photo_url).state;
+      - logger.log: "Theme photo downloaded successfully."
+    on_error:
+      - logger.log:
+          format: "Theme photo download/decode failed for URL: %s"
+          args: ["id(theme_photo_url).state.c_str()"]
+      - if:
+          # If we already have a good photo decoded (from a prior
+          # successful download), a failed redownload attempt shouldn't
+          # blank the screen - the old buffer is still intact since the
+          # failure happened before it could be overwritten. Just leave/put
+          # the existing photo back on screen instead.
+          condition:
+            lambda: |-
+              return id(theme_photo_load_ok) &&
+                     id(home_theme_select).active_index().value_or(0) == 1;
+          then:
+            - lambda: |-
+                lv_obj_clear_flag(id(theme_photo_img), LV_OBJ_FLAG_HIDDEN);
+            - logger.log: "Keeping previously loaded theme photo visible after download failure."
+          else:
+            - lambda: |-
+                id(theme_photo_load_ok) = false;
 
 display:
   - platform: mipi_spi
@@ -1310,6 +1512,31 @@ lvgl:
       scrollable: false
       scrollbar_mode: "OFF"
       widgets:
+        # "URL Photo" theme background. Sits behind the matrix rain and all
+        # other home-page widgets since it's declared first. 100% width/height
+        # + a computed transform_zoom scales the photo up to COVER the full
+        # screen (cropping overflow) instead of letterboxing it - re-evaluated
+        # whenever the widget is refreshed (new download, theme switch,
+        # rotation change - see the various lvgl.widget.update calls).
+        # Hidden by default because the default theme is Matrix; toggled by
+        # apply_home_theme (see script: section).
+        - image:
+            id: theme_photo_img
+            src: theme_photo_image
+            align: CENTER
+            x: 0
+            y: 0
+            width: 100%
+            height: 100%
+            hidden: true
+            transform_zoom: !lambda |-
+              if (id(theme_photo_w) <= 0 || id(theme_photo_h) <= 0) return 256;
+              int screen_w = id(is_portrait) ? 240 : 320;
+              int screen_h = id(is_portrait) ? 320 : 240;
+              float zoom_w = (float) screen_w / (float) id(theme_photo_w);
+              float zoom_h = (float) screen_h / (float) id(theme_photo_h);
+              float zoom = zoom_w > zoom_h ? zoom_w : zoom_h;
+              return (int) (zoom * 256.0f);
         - label:
             id: matrix_col_0
             text: "3\nア\n1\nキ\n4\n0\nタ\n2\nネ\n5\n1\nヲ\n3\nン\n0\nミ"
@@ -1868,23 +2095,7 @@ lvgl:
                               id: pin_buffer
                               value: '""'
                           - lambda: 'lv_label_set_text(id(settings_pin_display), "");'
-                          - if:
-                              condition:
-                                api.connected: {}
-                              then:
-                                - homeassistant.service:
-                                    service: script.turn_on
-                                    data:
-                                      entity_id: ${door_lock_script_entity}
-                                    on_error:
-                                      - logger.log:
-                                          format: "HA service error (script.turn_on door lock via door_pin): %s"
-                                          args: ["error.c_str()"]
-                                          tag: ha_service
-                              else:
-                                - logger.log:
-                                    format: "Skipped HA service call: no API connection"
-                                    tag: ha_service
+                          - script.execute: unlock_door_via_ha
                           - globals.set:
                               id: current_page
                               value: '"home"'
@@ -1921,23 +2132,7 @@ lvgl:
                   text_color: 0x3D7BFF
                   align: CENTER
             on_click:
-              - if:
-                  condition:
-                    api.connected: {}
-                  then:
-                    - homeassistant.service:
-                        service: script.turn_on
-                        data:
-                          entity_id: ${door_lock_script_entity}
-                        on_error:
-                          - logger.log:
-                              format: "HA service error (script.turn_on door lock): %s"
-                              args: ["error.c_str()"]
-                              tag: ha_service
-                  else:
-                    - logger.log:
-                        format: "Skipped HA service call: no API connection"
-                        tag: ha_service
+              - script.execute: unlock_door_via_ha
         - button:
             id: settings_dialpad_btn
             x: 10
@@ -2619,6 +2814,18 @@ lvgl:
 
 text:
   - platform: template
+    name: "Display - Theme Photo URL"
+    id: theme_photo_url
+    icon: "mdi:image-outline"
+    entity_category: CONFIG
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    max_length: 255
+    on_value:
+      - script.execute: apply_home_theme
+  - platform: template
     name: "Door - Caption (Apt/Unit)"
     id: door_caption_message
     icon: "mdi:card-text-outline"
@@ -2733,6 +2940,19 @@ datetime:
       - script.execute: apply_availability_status
 
 select:
+  - platform: template
+    name: "Display - Theme"
+    id: home_theme_select
+    icon: "mdi:image-multiple-outline"
+    entity_category: CONFIG
+    optimistic: true
+    restore_value: true
+    initial_option: "Matrix"
+    options:
+      - "Matrix"
+      - "URL Photo"
+    set_action:
+      - script.execute: apply_home_theme
   - platform: template
     name: "Display - Screen Rotation"
     id: screen_rotation_select
