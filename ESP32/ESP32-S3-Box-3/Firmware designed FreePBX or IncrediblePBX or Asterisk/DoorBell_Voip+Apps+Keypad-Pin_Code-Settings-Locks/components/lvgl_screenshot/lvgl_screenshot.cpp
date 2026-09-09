@@ -143,24 +143,28 @@ void LvglScreenshot::do_capture_() {
 
   JpegWriteCtx ctx = {this->jpeg_buf_, this->jpeg_capacity_, 0};
 
-  if (stride == width * 3u) {
-    // Common case: no row padding, buffer is already tightly packed.
-    stbi_write_jpg_to_func(LvglScreenshot::jpeg_write_cb_, &ctx, (int) width, (int) height, 3, snap->data,
-                            this->quality_);
-  } else {
-    // LVGL padded each row for alignment - compact into a tightly packed
-    // scratch buffer since stb only understands a fixed width*channels stride.
-    uint8_t *packed = (uint8_t *) heap_caps_malloc((size_t) width * height * 3u, MALLOC_CAP_SPIRAM);
-    if (packed) {
-      for (uint32_t y = 0; y < height; y++) {
-        memcpy(packed + y * width * 3u, snap->data + y * stride, width * 3u);
+  // LVGL's RGB888 draw buffer stores each pixel as B,G,R in memory (matching
+  // its packed 0xRRGGBB little-endian convention), but stb_image_write
+  // expects true R,G,B byte order. Always repack into a scratch buffer with
+  // the channels swapped - this also handles LVGL's row padding (stride !=
+  // width * 3) in the same pass, since stb only understands a fixed
+  // width*channels stride.
+  uint8_t *packed = (uint8_t *) heap_caps_malloc((size_t) width * height * 3u, MALLOC_CAP_SPIRAM);
+  if (packed) {
+    for (uint32_t y = 0; y < height; y++) {
+      const uint8_t *src_row = snap->data + y * stride;
+      uint8_t *dst_row = packed + y * width * 3u;
+      for (uint32_t x = 0; x < width; x++) {
+        dst_row[x * 3 + 0] = src_row[x * 3 + 2];  // R (was at offset 2)
+        dst_row[x * 3 + 1] = src_row[x * 3 + 1];  // G (unchanged)
+        dst_row[x * 3 + 2] = src_row[x * 3 + 0];  // B (was at offset 0)
       }
-      stbi_write_jpg_to_func(LvglScreenshot::jpeg_write_cb_, &ctx, (int) width, (int) height, 3, packed,
-                              this->quality_);
-      heap_caps_free(packed);
-    } else {
-      ESP_LOGE(TAG, "Failed to allocate scratch buffer for row-packing");
     }
+    stbi_write_jpg_to_func(LvglScreenshot::jpeg_write_cb_, &ctx, (int) width, (int) height, 3, packed,
+                            this->quality_);
+    heap_caps_free(packed);
+  } else {
+    ESP_LOGE(TAG, "Failed to allocate scratch buffer for row-packing");
   }
 
   lv_draw_buf_destroy(snap);
