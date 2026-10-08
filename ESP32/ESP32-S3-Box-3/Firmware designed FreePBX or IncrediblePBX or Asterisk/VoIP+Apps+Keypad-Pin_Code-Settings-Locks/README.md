@@ -3,6 +3,7 @@
 An [ESPHome](https://esphome.io/) configuration that turns an **M5Stack / Espressif ESP32-S3-Box-3** into a wall-mounted VOIP intercom and Home Assistant control panel, with:
 
 - 📞 **SIP/VOIP calling** (speed dial + manual dialpad) via [`sip_client`](https://github.com/eigger/espcomponents)
+- 💬 **Two-way text messaging** with other SIP extensions (e.g. Zoiper) — Apps → MESSAGES on the panel, with an unread badge, the 5 newest texts, and a popup + chime on the home screen when a text arrives
 - 🔔 Ringtone playback on incoming calls (RTTTL), with a "Test Ringtone" diagnostic button
 - 🔒 A PIN-protected door lock control page
 - 💡 Light control (brightness + color temperature) synced live with Home Assistant
@@ -37,6 +38,7 @@ The mic and speaker share the same physical I2S pins (`GPIO45` LRCLK, `GPIO17` B
 - [ESPHome](https://esphome.io/) 2024.8.0 or newer
 - A running [Home Assistant](https://www.home-assistant.io/) instance
 - A SIP/VOIP server reachable on your network (e.g. Asterisk, FreePBX, or a similar PBX) with at least one extension for this device
+- For texting: your own-pbx install with the messages patch applied (see [5. Text messaging](#5-text-messaging-messages-app)) — the panel's `sip_client` is voice-calls only and can't do SIP MESSAGE itself, so texts go panel → Home Assistant → own-pbx → SIP MESSAGE
 - The external component [`eigger/espcomponents`](https://github.com/eigger/espcomponents) (pulled in automatically via `external_components:`)
 
 ---
@@ -92,6 +94,38 @@ esphome run speed_dial.yaml
 
 First flash needs a USB cable; after that, OTA updates work over Wi-Fi.
 
+### 5. Text messaging (Messages app)
+
+The panel is already wired for it (Apps → MESSAGES is in this yaml) — you just need the other two ends:
+
+**a) own-pbx brain** — needs a small patch (`PBX_STATUS_HOST` bind + token auth, `store` mode on `/messages/send`, and a `/messages/inbox` endpoint):
+
+```bash
+cd <your own-pbx dir>   # the folder containing pbx-brain/
+patch -p1 < own-pbx-brain-messages.patch
+```
+
+```ini
+# e.g. /etc/systemd/system/pbx-brain.service.d/msg.conf, then
+# systemctl daemon-reload && systemctl restart pbx-brain
+[Service]
+Environment=PBX_STATUS_HOST=0.0.0.0
+Environment=PBX_MSG_TOKEN=<a long random token — save it, HA needs it>
+```
+
+Verify: `curl -H "X-Msg-Token: <token>" "http://<pbx-ip>:8099/messages/inbox?ext=<box-ext>&limit=5"` should return `{"messages": [...], "ok": true}`, and a wrong token should return `{"ok": false, "error": "bad token"}`.
+
+**b) Home Assistant** — drop `ha_pbx_messages.yaml` into `/config/packages/` (⚠️ the filename MUST use underscores — `ha-pbx-messages.yaml` with dashes is rejected as an invalid package slug and the whole package silently never loads), and make sure `configuration.yaml` has:
+
+```yaml
+homeassistant:
+  packages: !include_dir_named packages
+```
+
+Edit the token, PBX IP, and the box's extension near the top of the package file, then restart HA. Check Developer Tools → States: `sensor.pbx_inbox` should show a number (the newest message id).
+
+The extension the panel texts as needs `msg_out` enabled and a messages quota in own-pbx; whoever you text needs `msg_in` enabled. Quotas/blocks are enforced server-side, same as the portal — denied sends show up as a "PBX text not sent" notification in HA with the reason.
+
 ---
 
 ## Features in detail
@@ -107,6 +141,8 @@ First flash needs a USB cable; after that, OTA updates work over Wi-Fi.
 **IR menu** — Toggle buttons for TV, soundbar, and fan, mirroring the real Home Assistant switch state (button recolors if changed externally).
 
 **Settings page** — Master volume (+/‑ buttons), backlight brightness slider, speaker mute switch, PIN-lock toggle for the door, and the ringtone test button. Entry to this page is PIN-protected.
+
+**Text messages (Messages app)** — Apps → MESSAGES opens the texting screen: **To:** field, message box (on-screen keyboard pops up on tap), SEND, and the 5 newest texts. A red badge on the MESSAGES button counts unread; opening the page clears it. When a text arrives while you're on the home screen, a popup card shows it with an **X** to dismiss (auto-dismisses after 5s) plus a short chime — no chime during an active call. You can also send and read from HA without touching the panel: the device exposes `Message To` / `Message Compose` text fields, a `Send Text Message` button, and `Inbox Line 1..5` mirrors.
 
 ---
 
