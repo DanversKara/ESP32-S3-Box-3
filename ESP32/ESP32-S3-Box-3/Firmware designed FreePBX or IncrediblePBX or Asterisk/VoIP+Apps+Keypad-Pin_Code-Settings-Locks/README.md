@@ -57,6 +57,8 @@ voip_test_account_extension: "705"            # your SIP extension/username
 voip_test_account_password: "yourSipPassword"
 settings_pin: "1234"                          # PIN to enter the on-device Settings page
 door_pin: "5678"                              # PIN to unlock the door from the panel
+pbx_msg_token: "token"
+pbx_esp_ext: "8803"
 ```
 
 ### 2. Substitutions
