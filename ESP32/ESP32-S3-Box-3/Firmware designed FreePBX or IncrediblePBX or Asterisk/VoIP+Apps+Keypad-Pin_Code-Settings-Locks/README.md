@@ -57,6 +57,8 @@ voip_test_account_extension: "705"            # your SIP extension/username
 voip_test_account_password: "yourSipPassword"
 settings_pin: "1234"                          # PIN to enter the on-device Settings page
 door_pin: "5678"                              # PIN to unlock the door from the panel
+pbx_msg_token: "token"
+pbx_esp_ext: "8803"
 ```
 
 ### 2. Substitutions
@@ -95,6 +97,7 @@ esphome run speed_dial.yaml
 First flash needs a USB cable; after that, OTA updates work over Wi-Fi.
 
 ### 5. Text messaging (Messages app)
+- notice this text message system was devoplted for https://github.com/DanversKara/MyPersonalPBX unsure and not tested if it works for FreePBX / IncreiblePBX, youll have to feed this into Cluade or Meta MuseAi and see if it can configure this for FreePBX/IncreiblePBX and also go thru https://github.com/DanversKara/MyPersonalPBX to get the correct API details and change them based off FreePBX/IncreiblePBX APIS
 
 The panel is already wired for it (Apps → MESSAGES is in this yaml) — you just need the other two ends:
 
