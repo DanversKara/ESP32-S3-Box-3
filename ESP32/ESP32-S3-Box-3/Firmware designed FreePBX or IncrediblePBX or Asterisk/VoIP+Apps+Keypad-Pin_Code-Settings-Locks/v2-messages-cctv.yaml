@@ -16,10 +16,46 @@ substitutions:
   menu_fan_entity: fan.living_room_fan          # your IR fan switch entity
   menu_tv_entity: switch.living_room_tv_ir           # your IR TV switch entity
   menu_soundbar_entity: switch.living_room_soundbar     # your IR soundbar switch entity
+  #── VoIP defaults — only used until you save new values on Settings > VoIP ──
+  # The server must be an IP address (the SIP component can't do DNS) and the
+  # port goes in its own field, never as "ip:port".
+  sip_server_default: "192.168.8.220"
+  sip_port_default: "5060"
+  #── CCTV (esp_rtsp_stream) — must be MJPEG, not H.264/H.265.
+  # The camera's own RTSP (rtsp://192.168.8.230/live1) is H.264, so this reads
+  # motionEye's MJPEG streaming port instead (plain HTTP multipart MJPEG).
+  # Also accepts rtsp:// URLs for cameras that offer MJPEG over RTSP.
+  # If you turn on motionEye stream authentication, use
+  # http://user:pass@192.168.8.212:9081/ (Basic auth).
+  cctv_url: "http://192.168.8.212:9081/"
 
 external_components:
   - source: github://eigger/espcomponents
     components: [ sip_client ]
+  # RTSP/HTTP MJPEG camera viewer (CCTV page + floating home-screen window).
+  # Local copy of github://chickymonkey/Esp-rtsp-stream with HTTP MJPEG
+  # (motionEye) support added. Keep the "components" folder next to this YAML.
+  - source:
+      type: local
+      path: components
+    components: [ esp_rtsp_stream ]
+
+#── CCTV stream ───────────────────────────────────────────────────────────
+# One RTSP session feeds two LVGL canvases: the full CCTV page and the
+# floating window on the home page. The pages' on_load handlers point the
+# stream at whichever canvas is on screen (see cctv_use_page_canvas /
+# cctv_use_float_canvas). Frames are only decoded while that canvas is
+# visible; the RTSP session itself stays connected so the picture comes
+# back instantly.
+esp_rtsp_stream:
+  - id: cctv
+    url: ${cctv_url}
+    lvgl_canvas: cctv_page_canvas
+    output_width: 320
+    output_height: 200
+    rotation: 0
+    max_fps: 12
+    log_frame_info: true
 
 esphome:
   name: ${name}
@@ -29,16 +65,52 @@ esphome:
   project:
     name: "kara_danvers.esp32-s3box-3"
     version: "1.0.0"
+  # Small C++ helper for the Wi-Fi scan button. Keep s3box_helpers.h in the
+  # same folder as this YAML file.
+  includes:
+    - s3box_helpers.h
   on_boot:
-    priority: 600
-    then:
-      - audio_dac.mute_off: es8311_dac
-      - audio_dac.set_volume:
-          id: es8311_dac
-          volume: 85%
-      - audio_adc.set_mic_gain:
-          id: es7210_adc
-          mic_gain: !lambda 'return id(mic_gain_db);'
+    - priority: 600
+      then:
+        - audio_dac.mute_off: es8311_dac
+        - audio_dac.set_volume:
+            id: es8311_dac
+            volume: 85%
+        - audio_adc.set_mic_gain:
+            id: es7210_adc
+            mic_gain: !lambda 'return id(mic_gain_db);'
+    # Runs after every component (including the saved text entities) has been
+    # set up, but before the main loop starts — so the SIP client hasn't opened
+    # its socket yet and picks up the saved server/port/user/password.
+    - priority: -200
+      then:
+        - lambda: |-
+            std::string srv = id(sip_server_text).state;
+            std::string dom = id(sip_domain_text).state;
+            std::string usr = id(sip_user_text).state;
+            std::string pwd = id(sip_pass_text).state;
+            int port = atoi(id(sip_port_text).state.c_str());
+            // Forgive "192.168.8.100:5072" typed into the server field.
+            size_t colon = srv.find(':');
+            if (colon != std::string::npos) {
+              int p2 = atoi(srv.substr(colon + 1).c_str());
+              if (p2 > 0) port = p2;
+              srv = srv.substr(0, colon);
+            }
+            if (!srv.empty()) {
+              id(phone).set_server(srv);
+              id(phone).set_domain(dom.empty() ? srv : dom);
+            } else if (!dom.empty()) {
+              id(phone).set_domain(dom);
+            }
+            if (port > 0 && port <= 65535) id(phone).set_port((uint16_t) port);
+            if (!usr.empty()) id(phone).set_username(usr);
+            if (!pwd.empty()) id(phone).set_password(pwd);
+            std::string ext = usr.empty() ? std::string("${voip_test_account_extension}") : usr;
+            lv_label_set_text(id(caller_ext_label), ext.c_str());
+            ESP_LOGI("voip", "SIP target %s:%d as %s",
+                     srv.empty() ? "${sip_server_default}" : srv.c_str(),
+                     (port > 0 ? port : atoi("${sip_port_default}")), ext.c_str());
 
 esp32:
   board: esp32s3box
@@ -143,6 +215,22 @@ time:
   id: sntp_time
 
 interval:
+  # CCTV "Connecting..." overlays - hidden once frames are flowing.
+  - interval: 1s
+    then:
+      - lambda: |-
+          const bool streaming = id(cctv).is_streaming();
+          const bool live = streaming && id(cctv).has_frame();
+          const char *txt = streaming ? "Waiting for video..." : "Connecting to camera...";
+          lv_obj_t *labels[2] = {id(cctv_page_status), id(cctv_float_status)};
+          for (lv_obj_t *l : labels) {
+            if (live) {
+              lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_label_set_text(l, txt);
+              lv_obj_clear_flag(l, LV_OBJ_FLAG_HIDDEN);
+            }
+          }
   - interval: 1s
     then:
       lambda: |-
@@ -218,6 +306,10 @@ interval:
           - lambda: |-
               lv_obj_add_flag(id(call_return_btn), LV_OBJ_FLAG_HIDDEN);
 
+#── Bluetooth ────────────────────────────────────────────────────────────
+# Home Assistant Bluetooth proxy only. HA uses the box's BLE radio to see
+# nearby devices (sensors, SwitchBot, phones/tags for room presence, etc.)
+# and decides how to use it - nothing else to configure on the box.
 esp32_ble_tracker:
 
 bluetooth_proxy:
@@ -248,6 +340,10 @@ light:
     restore_mode: ALWAYS_ON
 
 sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
   - platform: adc
     pin: GPIO10
     id: battery_voltage
@@ -333,6 +429,35 @@ sensor:
                   id: light_temp_slider
                   value: !lambda 'return (int)x;'
 
+  #── Messages app: unread count ───────────────────────────────
+  # Drives the red badge next to APPS (home) and on the Apps-page
+  # MESSAGES button. Opening the Messages page resets it (see open_messages_btn).
+  - platform: homeassistant
+    id: msg_unread_count
+    entity_id: input_number.pbx_unread
+    internal: true
+    on_value:
+      - lambda: |-
+          int cur = (int) x;
+          if (cur > 0) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", cur);
+            lv_label_set_text(id(msg_badge), buf);
+            lv_obj_clear_flag(id(msg_badge), LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(id(msg_apps_badge), buf);
+            lv_obj_clear_flag(id(msg_apps_badge), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(msg_badge), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(msg_apps_badge), LV_OBJ_FLAG_HIDDEN);
+          }
+          // Flag a genuine new arrival (count went up) for the step below.
+          id(msg_is_new) = cur > id(msg_unread_prev);
+          id(msg_unread_prev) = cur;
+      - if:
+          condition:
+            lambda: 'return id(msg_is_new);'
+          then:
+            - script.execute: msg_popup_show
 i2s_audio:
   - id: mic_bus
     i2s_lrclk_pin:
@@ -416,6 +541,57 @@ rtttl:
                 rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
 
 button:
+  #── Wi-Fi / VoIP controls for the Home Assistant device page ─────────────
+  - platform: template
+    name: "Scan Wi-Fi Networks"
+    icon: "mdi:wifi-refresh"
+    entity_category: config
+    on_press:
+      - script.execute: wifi_start_scan
+  # Joins the network typed into "Wi-Fi New Network" / "Wi-Fi New Password".
+  # Same safety net as the screen: if it can't join in 30s it goes back to
+  # the previous network.
+  - platform: template
+    name: "Connect to New Wi-Fi"
+    icon: "mdi:wifi-arrow-right"
+    entity_category: config
+    on_press:
+      - if:
+          condition:
+            lambda: 'return !id(ha_wifi_ssid).state.empty();'
+          then:
+            - wifi.configure:
+                ssid: !lambda 'return id(ha_wifi_ssid).state;'
+                password: !lambda 'return id(ha_wifi_password).state;'
+                save: true
+                timeout: 30s
+                on_connect:
+                  - logger.log: "Wi-Fi: joined network set from Home Assistant"
+                  - text.set:
+                      id: ha_wifi_password
+                      value: ""
+                on_error:
+                  - logger.log: "Wi-Fi: could not join, reverted to previous network"
+                  - text.set:
+                      id: ha_wifi_password
+                      value: ""
+          else:
+            - logger.log: "Wi-Fi: type a network name in 'Wi-Fi New Network' first"
+  # The box re-reads the VoIP settings at boot, so this reboots it.
+  - platform: template
+    name: "Apply VoIP Settings (Reboot)"
+    icon: "mdi:phone-sync"
+    entity_category: config
+    on_press:
+      - if:
+          condition:
+            lambda: 'return !id(call_in_progress);'
+          then:
+            - logger.log: "VoIP: applying settings from Home Assistant, rebooting"
+            - delay: 500ms
+            - lambda: 'App.safe_reboot();'
+          else:
+            - logger.log: "VoIP: call in progress, not rebooting"
   - platform: template
     name: "Test Ringtone"
     entity_category: diagnostic
@@ -425,7 +601,56 @@ button:
           id: ringtone
           rtttl: "ring:d=8,o=5,b=180:c6,g5,c6,g5,p,c6,g5,c6,g5"
 
+  # ── Messages app: send from the HA device page ──────────────────
+  # Pressing this in HA sends whatever is in "Message To" / "Message Compose".
+  - platform: template
+    name: "Send Text Message"
+    id: msg_send_btn
+    icon: "mdi:send"
+    on_press:
+      - homeassistant.service:
+          service: script.esp_send_text
+          data_template:
+            to_ext: !lambda 'return id(msg_to_ext).state;'
+            body: !lambda 'return id(msg_compose).state;'
+
 script:
+  #── CCTV: point the single RTSP stream at the full-page canvas ──
+  - id: cctv_use_page_canvas
+    then:
+      - lambda: |-
+          lv_canvas_fill_bg(id(cctv_page_canvas), lv_color_hex(0x000000), LV_OPA_COVER);
+          id(cctv).set_lvgl_canvas(&id(cctv_page_canvas));
+          id(cctv).set_output_size(320, 200);
+  #── CCTV: point the stream at the floating home-page window ──
+  - id: cctv_use_float_canvas
+    then:
+      - lambda: |-
+          lv_canvas_fill_bg(id(cctv_float_canvas), lv_color_hex(0x000000), LV_OPA_COVER);
+          id(cctv).set_lvgl_canvas(&id(cctv_float_canvas));
+          id(cctv).set_output_size(id(cctv_w), id(cctv_h));
+  #── CCTV: apply saved position/size/visibility to the floating window and
+  # refresh the on/off indicators (home-page camera icon, CCTV-page button).
+  - id: cctv_float_apply
+    then:
+      - lambda: |-
+          lv_obj_t *w = id(cctv_float);
+          lv_obj_t *scr = lv_obj_get_parent(w);
+          const int sw = lv_obj_get_width(scr), sh = lv_obj_get_height(scr);
+          int cw = std::max(96, std::min(id(cctv_w), sw));
+          int ch = std::max(54, std::min(id(cctv_h), sh));
+          int cx = std::max(0, std::min(id(cctv_x), sw - cw));
+          int cy = std::max(0, std::min(id(cctv_y), sh - ch));
+          id(cctv_w) = cw; id(cctv_h) = ch; id(cctv_x) = cx; id(cctv_y) = cy;
+          lv_obj_set_size(w, cw, ch);
+          lv_obj_set_pos(w, cx, cy);
+          if (id(cctv_float_on)) lv_obj_clear_flag(w, LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(w, LV_OBJ_FLAG_HIDDEN);
+          lv_obj_set_style_text_color(id(cctv_home_toggle_label),
+              lv_color_hex(id(cctv_float_on) ? 0xFFC107 : 0x5A6472), 0);
+          lv_label_set_text(id(cctv_float_btn_label),
+              id(cctv_float_on) ? "FLOAT: ON" : "FLOAT: OFF");
+          if (id(current_page) == "home") id(cctv).set_output_size(cw, ch);
   # Single place that redraws the three status icons in the top-left group
   # (phone connector, mic-in-use, auto-answer) from current global state.
   # Called from every place that changes one of those globals instead of
@@ -471,9 +696,85 @@ script:
             lv_obj_set_style_text_color(id(auto_answer_status_icon), lv_color_hex(0xFFA500), 0);
           }
 
+  # Refreshes the "Connected: SSID  IP" line on the Wi-Fi settings page.
+  - id: update_wifi_page_status
+    then:
+      - lambda: |-
+          std::string s;
+          if (id(wifi_connected)) {
+            s = "Connected: " + id(wifi_cur_ssid).state + "   " + id(wifi_cur_ip).state;
+          } else {
+            s = "Not connected to Wi-Fi";
+          }
+          lv_label_set_text(id(wifi_current_label), s.c_str());
+
+  # Background Wi-Fi scan (stays connected). Results arrive through the
+  # wifi_info scan_results sensor in text_sensor: below.
+  - id: wifi_start_scan
+    then:
+      - if:
+          condition:
+            lambda: 'return id(call_in_progress);'
+          then:
+            - lambda: 'lv_label_set_text(id(wifi_page_status), "Finish the call before scanning");'
+          else:
+            - lambda: |-
+                if (s3box_start_wifi_scan()) {
+                  lv_label_set_text(id(wifi_page_status), "Scanning...");
+                } else {
+                  lv_label_set_text(id(wifi_page_status), "Wi-Fi busy, try Scan again in a few seconds");
+                }
+
+  # Copies the saved VoIP settings into the VoIP page's text boxes.
+  - id: voip_fill_page
+    then:
+      - lambda: |-
+          lv_textarea_set_text(id(voip_server_ta), id(sip_server_text).state.c_str());
+          lv_textarea_set_text(id(voip_port_ta), id(sip_port_text).state.c_str());
+          lv_textarea_set_text(id(voip_domain_ta), id(sip_domain_text).state.c_str());
+          lv_textarea_set_text(id(voip_user_ta), id(sip_user_text).state.c_str());
+          lv_textarea_set_text(id(voip_pass_ta), "");
+          std::string usr = id(sip_user_text).state.empty()
+              ? std::string("${voip_test_account_extension}") : id(sip_user_text).state;
+          std::string s = "Now: " + id(sip_server_text).state + ":" + id(sip_port_text).state + " as " + usr;
+          lv_label_set_text(id(voip_current_label), s.c_str());
+          lv_label_set_text(id(voip_reg_label),
+              id(sip_registered) ? "SIP: registered" : "SIP: NOT registered");
+          lv_obj_set_style_text_color(id(voip_reg_label),
+              lv_color_hex(id(sip_registered) ? 0x2ECC71 : 0xE74C3C), 0);
+
+  # ── Messages app: incoming-text popup ──────────────────────────
+  # Shows the newest text over the home page with an X to dismiss;
+  # auto-hides after 5s. mode: restart so a second text refreshes the
+  # text and restarts the timer instead of stacking popups. The chime
+  # is skipped while a call is active (speaker is busy).
+  - id: msg_popup_show
+    mode: restart
+    then:
+      - lambda: |-
+          lv_label_set_text(id(msg_popup_text), id(msg_inbox_1).state.c_str());
+      - if:
+          condition:
+            lambda: 'return id(current_page) == "home";'
+          then:
+            - lvgl.widget.show: msg_popup
+      - if:
+          condition:
+            lambda: 'return !id(call_active);'
+          then:
+            - rtttl.play:
+                id: ringtone
+                rtttl: "msg:d=16,o=6,b=180:a6,p,e7"
+      - delay: 5s
+      - lvgl.widget.hide: msg_popup
+
 sip_client:
   id: phone
-  server: "192.168.8.220"
+  # These are only the first-boot defaults. After that, the values saved on
+  # Settings > VoIP (or in HA under this device's Configuration) win - they are
+  # applied in esphome: on_boot (priority -200) above.
+  server: "${sip_server_default}"
+  port: ${sip_port_default}
   username: ${voip_test_account_extension}
   password: ${voip_test_account_password}
   microphone: box_mic
@@ -485,6 +786,9 @@ sip_client:
         id: sip_registered
         value: 'true'
     - script.execute: update_status_icons
+    - lambda: |-
+        lv_label_set_text(id(voip_reg_label), "SIP: registered");
+        lv_obj_set_style_text_color(id(voip_reg_label), lv_color_hex(0x2ECC71), 0);
   on_incoming_call:
     - logger.log:
         format: "Incoming call from %s"
@@ -573,10 +877,86 @@ sip_client:
     - lvgl.page.show: home_page
 
 text_sensor:
+  #── Wi-Fi info for Settings > Wi-Fi ───────────────────────────────────────
+  - platform: wifi_info
+    ssid:
+      id: wifi_cur_ssid
+      name: "Wi-Fi Connected Network"
+      icon: "mdi:wifi"
+      entity_category: diagnostic
+      on_value:
+        - script.execute: update_wifi_page_status
+    ip_address:
+      id: wifi_cur_ip
+      name: "Wi-Fi IP Address"
+      icon: "mdi:ip-network"
+      entity_category: diagnostic
+      on_value:
+        - script.execute: update_wifi_page_status
+    # Fires whenever a scan finishes - rebuilds the network dropdown from the
+    # full result list (deduplicated, strongest first).
+    # Shown in HA after pressing "Scan Wi-Fi Networks" (or the screen's Scan).
+    scan_results:
+      id: wifi_scan_results
+      name: "Wi-Fi Networks Nearby"
+      icon: "mdi:wifi-refresh"
+      entity_category: diagnostic
+      on_value:
+        - lambda: |-
+            std::vector<std::pair<int, std::string>> seen;
+            for (auto &r : wifi::global_wifi_component->get_scan_result()) {
+              if (r.get_is_hidden()) continue;
+              std::string s(r.get_ssid().c_str(), r.get_ssid().size());
+              if (s.empty()) continue;
+              bool dup = false;
+              for (auto &p : seen) {
+                if (p.second == s) {
+                  if (r.get_rssi() > p.first) p.first = r.get_rssi();
+                  dup = true;
+                  break;
+                }
+              }
+              if (!dup) seen.push_back({(int) r.get_rssi(), s});
+            }
+            std::sort(seen.begin(), seen.end(),
+                      [](const std::pair<int, std::string> &a, const std::pair<int, std::string> &b) {
+                        return a.first > b.first;
+                      });
+            id(wifi_scan_ssids).clear();
+            std::string opts;
+            for (size_t i = 0; i < seen.size() && i < 25; i++) {
+              id(wifi_scan_ssids).push_back(seen[i].second);
+              char tail[16];
+              snprintf(tail, sizeof(tail), "  (%ddBm)", seen[i].first);
+              if (!opts.empty()) opts += "\n";
+              opts += seen[i].second + tail;
+            }
+            if (opts.empty()) opts = "No networks found";
+            lv_dropdown_set_options(id(wifi_ssid_dropdown)->obj, opts.c_str());
+            if (!id(wifi_scan_ssids).empty()) {
+              lv_dropdown_set_selected(id(wifi_ssid_dropdown)->obj, 0);
+              lv_textarea_set_text(id(wifi_ssid_ta), id(wifi_scan_ssids)[0].c_str());
+            }
+            lv_label_set_text(id(wifi_page_status),
+                seen.empty() ? "Scan finished - nothing found" : "Pick a network, type the password, Connect");
+
   - platform: homeassistant
     id: front_door_lock_state
     entity_id: lock.living_room_front_door_lock
     internal: true
+    on_value:
+      - lambda: |-
+          if (x == "locked") {
+            lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0x71CC2E), 0);
+            lv_label_set_text(id(lock_badge_label), "LOCKED");
+          } else if (x == "unlocked") {
+            lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0xe02e1c), 0);
+            lv_label_set_text(id(lock_badge_label), "UNLOCKED");
+          } else {
+            // "unknown"/"unavailable" while HA/SwitchBot is catching up
+            lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0x5A6472), 0);
+            lv_label_set_text(id(lock_badge_label), "...");
+          }
   # TV IR switch mirror — uses a text_sensor instead of homeassistant.switch
   # because that entity can briefly report "unknown"/"unavailable" (it's an
   # IR-blaster switch with no real feedback), and the homeassistant.switch
@@ -598,22 +978,6 @@ text_sensor:
               lv_obj_set_style_bg_color(id(tv_ir_btn), lv_color_hex(0x1F2632), 0);
 
 binary_sensor:
-  - platform: homeassistant
-    id: door_alarm
-    entity_id: binary_sensor.door_alarm_door
-    on_state:
-      if:
-        condition:
-          binary_sensor.is_on: door_alarm
-        then:
-          - lambda: |-
-              lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0xe02e1c), 0);
-              lv_label_set_text(id(lock_badge_label), "OPEN");
-        else:
-          - lambda: |-
-              lv_obj_set_style_bg_color(id(lock_badge), lv_color_hex(0x71CC2E), 0);
-              lv_label_set_text(id(lock_badge_label), "CLOSED");
-
   - platform: gpio
     pin:
       number: GPIO0
@@ -721,6 +1085,15 @@ globals:
     type: std::string
     restore_value: false
     initial_value: '"home"'
+  # Previous unread-text count, used to spot a genuinely new arrival.
+  - id: msg_unread_prev
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: msg_is_new
+    type: bool
+    restore_value: false
+    initial_value: 'false'
   - id: call_active
     type: bool
     restore_value: false
@@ -795,6 +1168,36 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  #── Settings > Wi-Fi ──
+  #── CCTV floating window (home page) — position/size/on-off survive reboots ──
+  - id: cctv_float_on
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  - id: cctv_x
+    type: int
+    restore_value: true
+    initial_value: '168'
+  - id: cctv_y
+    type: int
+    restore_value: true
+    initial_value: '46'
+  - id: cctv_w
+    type: int
+    restore_value: true
+    initial_value: '144'
+  - id: cctv_h
+    type: int
+    restore_value: true
+    initial_value: '108'
+  # Drag bookkeeping: a tap opens the full CCTV page, a drag only moves it.
+  - id: cctv_drag_dist
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: wifi_scan_ssids
+    type: std::vector<std::string>
+    restore_value: false
 
 
 display:
@@ -870,6 +1273,10 @@ lvgl:
     # ------------------------------------------------------------------
     - id: home_page
       bg_color: 0x000000
+      # Put the saved floating-CCTV geometry back and aim the stream at it.
+      on_load:
+        - script.execute: cctv_float_apply
+        - script.execute: cctv_use_float_canvas
       widgets:
         - obj:
             id: top_bar
@@ -903,6 +1310,19 @@ lvgl:
                         id: current_page
                         value: '"apps"'
                     - lvgl.page.show: apps_page
+              # Unread-texts badge next to APPS (driven by msg_unread_count).
+              - label:
+                  id: msg_badge
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+                  bg_color: 0xE74C3C
+                  bg_opa: COVER
+                  radius: 10
+                  pad_all: 3
+                  x: 80
+                  y: 2
+                  hidden: true
               - button:
                   id: lock_badge
                   align: TOP_MID
@@ -916,7 +1336,7 @@ lvgl:
                   widgets:
                     - label:
                         id: lock_badge_label
-                        text: "CLOSED"
+                        text: "..."
                         align: CENTER
                         text_font: font_small
                         text_color: 0xFFFFFF
@@ -938,29 +1358,13 @@ lvgl:
                               condition:
                                 api.connected: {}
                               then:
-                                - if:
-                                    condition:
-                                      lambda: 'return id(front_door_lock_state).state == "locked";'
-                                    then:
-                                      - homeassistant.service:
-                                          service: lock.unlock
-                                          data:
-                                            entity_id: lock.living_room_front_door_lock
-                                          on_error:
-                                            - logger.log:
-                                                format: "HA service error (lock.unlock): %s"
-                                                args: ["error.c_str()"]
-                                                tag: ha_service
-                                    else:
-                                      - homeassistant.service:
-                                          service: lock.lock
-                                          data:
-                                            entity_id: lock.living_room_front_door_lock
-                                          on_error:
-                                            - logger.log:
-                                                format: "HA service error (lock.lock): %s"
-                                                args: ["error.c_str()"]
-                                                tag: ha_service
+                                - homeassistant.service:
+                                    service: script.toggle_front_door_lock
+                                    on_error:
+                                      - logger.log:
+                                          format: "HA service error (script.toggle_front_door_lock): %s"
+                                          args: ["error.c_str()"]
+                                          tag: ha_service
                               else:
                                 - logger.log:
                                     format: "Skipped HA service call: no API connection"
@@ -1243,6 +1647,29 @@ lvgl:
                   x: 120
                   text_font: montserrat_18
                   text_color: 0xE74C3C
+        # Floating-CCTV on/off - amber when the window is shown, grey when
+        # hidden. Sits in the gap between the status icons and the battery.
+        - button:
+            id: cctv_home_toggle
+            align: BOTTOM_RIGHT
+            x: -74
+            y: -2
+            width: 36
+            height: 24
+            radius: 6
+            bg_opa: TRANSP
+            shadow_width: 0
+            border_width: 0
+            widgets:
+              - label:
+                  id: cctv_home_toggle_label
+                  text: "\uF008"
+                  align: CENTER
+                  text_font: montserrat_18
+                  text_color: 0xFFC107
+            on_click:
+              - lambda: 'id(cctv_float_on) = !id(cctv_float_on);'
+              - script.execute: cctv_float_apply
         - obj:
             id: battery_status_group
             align: BOTTOM_RIGHT
@@ -1305,6 +1732,209 @@ lvgl:
                   value: '"incall"'
               - lvgl.page.show: incall_page
 
+        # ------------------------------------------------------------------
+        # FLOATING CCTV WINDOW - picture-in-picture over the home screen.
+        #   * drag the picture to move it
+        #   * drag the amber corner grip to resize (keeps the camera's aspect)
+        #   * tap the picture to open the full CCTV page
+        #   * X hides it (camera icon at the bottom, the CCTV page, or the
+        #     "CCTV Floating Window" switch in HA brings it back).
+        #   Position, size and on/off are saved across reboots.
+        # The canvas is a fixed 320x240 buffer centred in the window; the
+        # window clips it and the stream is scaled to the window size, so
+        # resizing never needs a new canvas buffer.
+        # Declared after the other home widgets so it floats on top of them,
+        # but before msg_popup so a new-text popup still shows above it.
+        # ------------------------------------------------------------------
+        - obj:
+            id: cctv_float
+            align: TOP_LEFT
+            x: 168
+            y: 46
+            width: 144
+            height: 108
+            radius: 0
+            bg_color: 0x000000
+            bg_opa: COVER
+            border_width: 2
+            border_color: 0xFFC107
+            border_post: true
+            pad_all: 0
+            shadow_width: 12
+            shadow_color: 0x000000
+            shadow_opa: 70%
+            scrollable: false
+            scrollbar_mode: "OFF"
+            hidden: true
+            widgets:
+              - canvas:
+                  id: cctv_float_canvas
+                  align: CENTER
+                  width: 320
+                  height: 240
+                  transparent: false
+                  clickable: false
+              - label:
+                  id: cctv_float_status
+                  text: "Connecting..."
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xB7C0CC
+              - button:
+                  id: cctv_float_close
+                  align: TOP_RIGHT
+                  x: -3
+                  y: 3
+                  width: 24
+                  height: 24
+                  radius: 12
+                  bg_color: 0xE74C3C
+                  bg_opa: 85%
+                  shadow_width: 0
+                  pad_all: 0
+                  widgets:
+                    - label:
+                        text: "X"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - globals.set:
+                        id: cctv_float_on
+                        value: 'false'
+                    - script.execute: cctv_float_apply
+              # Resize grip (bottom-right corner) - drag it to resize.
+              - obj:
+                  id: cctv_float_grip
+                  align: BOTTOM_RIGHT
+                  x: 0
+                  y: 0
+                  width: 26
+                  height: 26
+                  radius: 0
+                  bg_color: 0xFFC107
+                  bg_opa: 80%
+                  border_width: 0
+                  pad_all: 0
+                  scrollable: false
+                  on_pressing:
+                    - lambda: |-
+                        lv_indev_t *indev = lv_indev_get_act();
+                        if (indev == nullptr) return;
+                        lv_point_t v;
+                        lv_indev_get_vect(indev, &v);
+                        if (v.x == 0 && v.y == 0) return;
+                        lv_obj_t *w = id(cctv_float);
+                        lv_obj_t *scr = lv_obj_get_parent(w);
+                        const int sw = lv_obj_get_width(scr), sh = lv_obj_get_height(scr);
+                        // Lock to the camera's aspect once a frame has arrived
+                        // (the decoded frame already fits the window keeping
+                        // aspect), 4:3 until then.
+                        float r = 4.0f / 3.0f;
+                        if (id(cctv).has_frame() && id(cctv).get_frame_height() > 0)
+                          r = (float) id(cctv).get_frame_width() / id(cctv).get_frame_height();
+                        // Follow whichever finger movement is bigger.
+                        const int dx = v.x, dy_as_w = (int) (v.y * r);
+                        const int d = abs(dx) >= abs(dy_as_w) ? dx : dy_as_w;
+                        const int x = lv_obj_get_x(w), y = lv_obj_get_y(w);
+                        float nw = lv_obj_get_width(w) + d;
+                        if (nw > sw - x) nw = sw - x;
+                        if (nw / r > sh - y) nw = (sh - y) * r;
+                        if (nw < 96) nw = 96;
+                        const int iw = (int) nw, ih = (int) (nw / r + 0.5f);
+                        lv_obj_set_size(w, iw, ih);
+                        id(cctv).set_output_size(iw, ih);
+                  on_release:
+                    - lambda: |-
+                        id(cctv_w) = lv_obj_get_width(id(cctv_float));
+                        id(cctv_h) = lv_obj_get_height(id(cctv_float));
+            # Drag to move.
+            on_press:
+              - globals.set:
+                  id: cctv_drag_dist
+                  value: '0'
+            on_pressing:
+              - lambda: |-
+                  lv_indev_t *indev = lv_indev_get_act();
+                  if (indev == nullptr) return;
+                  lv_point_t v;
+                  lv_indev_get_vect(indev, &v);
+                  if (v.x == 0 && v.y == 0) return;
+                  id(cctv_drag_dist) += abs(v.x) + abs(v.y);
+                  lv_obj_t *w = id(cctv_float);
+                  lv_obj_t *scr = lv_obj_get_parent(w);
+                  const int sw = lv_obj_get_width(scr), sh = lv_obj_get_height(scr);
+                  int x = lv_obj_get_x(w) + v.x;
+                  int y = lv_obj_get_y(w) + v.y;
+                  x = std::max(0, std::min(x, sw - (int) lv_obj_get_width(w)));
+                  y = std::max(0, std::min(y, sh - (int) lv_obj_get_height(w)));
+                  lv_obj_set_pos(w, x, y);
+            on_release:
+              - lambda: |-
+                  id(cctv_x) = lv_obj_get_x(id(cctv_float));
+                  id(cctv_y) = lv_obj_get_y(id(cctv_float));
+            # A tap (not a drag) opens the full-screen CCTV page.
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return id(cctv_drag_dist) < 8;'
+                  then:
+                    - globals.set:
+                        id: current_page
+                        value: '"cctv"'
+                    - lvgl.page.show: cctv_page
+
+        # Incoming-text popup - shown over the home page when a new text
+        # arrives (see msg_popup_show script). X dismisses it, and it
+        # auto-hides after 5s. Declared last on the home page so it
+        # renders on top.
+        - obj:
+            id: msg_popup
+            align: CENTER
+            width: 288
+            height: 150
+            radius: 16
+            bg_color: 0x1F2632
+            border_width: 2
+            pad_all: 12
+            hidden: true
+            widgets:
+              - label:
+                  text: "New message"
+                  text_font: font_small
+                  text_color: 0xE67E22
+                  align: TOP_LEFT
+                  x: 0
+                  y: 0
+              - button:
+                  id: msg_popup_close_btn
+                  align: TOP_RIGHT
+                  x: 0
+                  y: 0
+                  width: 36
+                  height: 36
+                  radius: 18
+                  bg_color: 0xE74C3C
+                  widgets:
+                    - label:
+                        text: "X"
+                        align: CENTER
+                        text_font: font_small
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - script.stop: msg_popup_show
+                    - lvgl.widget.hide: msg_popup
+              - label:
+                  id: msg_popup_text
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+                  x: 0
+                  y: 44
+                  width: 264
+                  long_mode: WRAP
+
+
     # ------------------------------------------------------------------
     # APPS PAGE
     # ------------------------------------------------------------------
@@ -1342,7 +1972,7 @@ lvgl:
             id: open_lights_btn
             x: 15
             y: 60
-            width: 140
+            width: 94
             height: 90
             radius: 16
             bg_color: 0x3D7BFF
@@ -1359,9 +1989,9 @@ lvgl:
               - lvgl.page.show: lights_page
         - button:
             id: open_ir_btn
-            x: 165
+            x: 113
             y: 60
-            width: 140
+            width: 94
             height: 90
             radius: 16
             bg_color: 0x8E44AD
@@ -1377,10 +2007,29 @@ lvgl:
                   value: '"ir"'
               - lvgl.page.show: ir_page
         - button:
+            id: open_cctv_btn
+            x: 211
+            y: 60
+            width: 94
+            height: 90
+            radius: 16
+            bg_color: 0x16A085
+            widgets:
+              - label:
+                  text: "CCTV"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"cctv"'
+              - lvgl.page.show: cctv_page
+        - button:
             id: open_phone_btn
             x: 15
             y: 160
-            width: 290
+            width: 140
             height: 60
             radius: 16
             bg_color: 0x2ECC71
@@ -1395,6 +2044,114 @@ lvgl:
                   id: current_page
                   value: '"dialpad"'
               - lvgl.page.show: dialpad_page
+        - button:
+            id: open_messages_btn
+            x: 165
+            y: 160
+            width: 140
+            height: 60
+            radius: 16
+            bg_color: 0xE67E22
+            widgets:
+              - label:
+                  text: "MESSAGES"
+                  align: CENTER
+                  text_font: font_medium
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  lv_textarea_set_text(id(msg_to_ta), id(msg_to_ext).state.c_str());
+              - globals.set:
+                  id: current_page
+                  value: '"messages"'
+              - lvgl.page.show: messages_page
+              - homeassistant.service:
+                  service: script.esp_messages_seen
+        - label:
+            id: msg_apps_badge
+            text: ""
+            text_font: font_small
+            text_color: 0xFFFFFF
+            bg_color: 0xE74C3C
+            bg_opa: COVER
+            radius: 10
+            pad_all: 3
+            x: 282
+            y: 152
+            hidden: true
+
+    # ------------------------------------------------------------------
+    # CCTV PAGE  (Apps > CCTV) - full-width view of ${cctv_url}.
+    # Shares the one RTSP stream with the floating home-page window.
+    # ------------------------------------------------------------------
+    - id: cctv_page
+      bg_color: 0x000000
+      on_load:
+        - script.execute: cctv_use_page_canvas
+        - script.execute: cctv_float_apply
+      widgets:
+        - canvas:
+            id: cctv_page_canvas
+            x: 0
+            y: 40
+            width: 320
+            height: 200
+            transparent: false
+            clickable: false
+        - label:
+            id: cctv_page_status
+            text: "Connecting..."
+            align: CENTER
+            y: 20
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - label:
+            text: "CCTV"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 12
+            y: 10
+        # Show / hide the floating window on the home screen.
+        - button:
+            id: cctv_float_btn
+            align: TOP_RIGHT
+            x: -88
+            y: 6
+            width: 100
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: cctv_float_btn_label
+                  text: "FLOAT: ON"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: 'id(cctv_float_on) = !id(cctv_float_on);'
+              - script.execute: cctv_float_apply
+        - button:
+            id: exit_cctv_btn
+            align: TOP_RIGHT
+            x: -10
+            y: 6
+            width: 70
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "EXIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"apps"'
+              - lvgl.page.show: apps_page
 
     # ------------------------------------------------------------------
     # LIGHTS PAGE  (ported from old.yaml's liv_lite_page — fill in
@@ -2484,29 +3241,13 @@ lvgl:
                         condition:
                           api.connected: {}
                         then:
-                          - if:
-                              condition:
-                                lambda: 'return id(front_door_lock_state).state == "locked";'
-                              then:
-                                - homeassistant.service:
-                                    service: lock.unlock
-                                    data:
-                                      entity_id: lock.living_room_front_door_lock
-                                    on_error:
-                                      - logger.log:
-                                          format: "HA service error (lock.unlock via PIN): %s"
-                                          args: ["error.c_str()"]
-                                          tag: ha_service
-                              else:
-                                - homeassistant.service:
-                                    service: lock.lock
-                                    data:
-                                      entity_id: lock.living_room_front_door_lock
-                                    on_error:
-                                      - logger.log:
-                                          format: "HA service error (lock.lock via PIN): %s"
-                                          args: ["error.c_str()"]
-                                          tag: ha_service
+                          - homeassistant.service:
+                              service: script.toggle_front_door_lock
+                              on_error:
+                                - logger.log:
+                                    format: "HA service error (script.toggle_front_door_lock via PIN): %s"
+                                    args: ["error.c_str()"]
+                                    tag: ha_service
                         else:
                           - logger.log:
                               format: "Skipped HA service call: no API connection"
@@ -2516,6 +3257,168 @@ lvgl:
                         id: pin_buffer
                         value: '""'
                     - lambda: 'lv_label_set_text(id(door_pin_display), "Wrong PIN");'
+
+    # MESSAGES PAGE - text other SIP extensions through own-pbx.
+    # To:/message textareas use the on-screen keyboard; SEND posts through
+    # Home Assistant (script.esp_send_text). New arrivals land via HA
+    # polling (sensor.pbx_inbox -> Inbox Line 1..5 text entities).
+    # ------------------------------------------------------------------
+    - id: messages_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Messages"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            align: TOP_LEFT
+            x: 12
+            y: 10
+        - button:
+            id: exit_messages_btn
+            align: TOP_RIGHT
+            x: -10
+            y: 6
+            width: 70
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "EXIT"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: msg_kb
+              - globals.set:
+                  id: current_page
+                  value: '"apps"'
+              - lvgl.page.show: apps_page
+        - label:
+            text: "To:"
+            text_font: font_small
+            text_color: 0x9AA3B2
+            x: 12
+            y: 52
+        - textarea:
+            id: msg_to_ta
+            x: 44
+            y: 44
+            width: 120
+            height: 34
+            one_line: true
+            max_length: 16
+            placeholder_text: "8801"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: msg_kb
+                  textarea: msg_to_ta
+              - lvgl.widget.show: msg_kb
+        - button:
+            id: msg_send_lvgl_btn
+            x: 176
+            y: 44
+            width: 132
+            height: 34
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  text: "SEND"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: msg_kb
+              - lambda: |-
+                  id(msg_to_ext).publish_state(lv_textarea_get_text(id(msg_to_ta)));
+                  id(msg_compose).publish_state(lv_textarea_get_text(id(msg_body_ta)));
+              - homeassistant.service:
+                  service: script.esp_send_text
+                  data_template:
+                    to_ext: !lambda 'return std::string(lv_textarea_get_text(id(msg_to_ta)));'
+                    body: !lambda 'return std::string(lv_textarea_get_text(id(msg_body_ta)));'
+              - lambda: 'lv_textarea_set_text(id(msg_body_ta), "");'
+        - textarea:
+            id: msg_body_ta
+            x: 12
+            y: 86
+            width: 296
+            height: 56
+            max_length: 255
+            placeholder_text: "Type a message"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: msg_kb
+                  textarea: msg_body_ta
+              - lvgl.widget.show: msg_kb
+        - obj:
+            id: msg_inbox_box
+            x: 8
+            y: 150
+            width: 304
+            height: 82
+            bg_color: 0x1A2130
+            radius: 10
+            pad_all: 6
+            layout:
+              type: FLEX
+              flex_flow: COLUMN
+            widgets:
+              - label:
+                  id: msg_line_1
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xD5DBDB
+                  width: 292
+                  long_mode: WRAP
+                  hidden: true
+              - label:
+                  id: msg_line_2
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xD5DBDB
+                  width: 292
+                  long_mode: WRAP
+                  hidden: true
+              - label:
+                  id: msg_line_3
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xD5DBDB
+                  width: 292
+                  long_mode: WRAP
+                  hidden: true
+              - label:
+                  id: msg_line_4
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xD5DBDB
+                  width: 292
+                  long_mode: WRAP
+                  hidden: true
+              - label:
+                  id: msg_line_5
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xD5DBDB
+                  width: 292
+                  long_mode: WRAP
+                  hidden: true
+        - keyboard:
+            id: msg_kb
+            textarea: msg_body_ta
+            align: BOTTOM_MID
+            width: 320
+            height: 120
+            hidden: true
+            on_ready:
+              - lvgl.widget.hide: msg_kb
+            on_cancel:
+              - lvgl.widget.hide: msg_kb
+
 
     # ------------------------------------------------------------------
     # DIAL PAD PAGE
@@ -3177,10 +4080,53 @@ lvgl:
               - light.turn_on:
                   id: led
                   brightness: !lambda 'return x / 100.0;'
+        # Shortcuts to the new sub-pages (scroll down on Settings to see them)
+        - button:
+            id: open_wifi_settings_btn
+            x: 10
+            y: 290
+            width: 145
+            height: 36
+            radius: 10
+            bg_color: 0x3D7BFF
+            widgets:
+              - label:
+                  text: "Wi-Fi"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"wifi"'
+              - lvgl.widget.hide: wifi_kb
+              - script.execute: update_wifi_page_status
+              - lvgl.page.show: wifi_page
+        - button:
+            id: open_voip_settings_btn
+            x: 165
+            y: 290
+            width: 145
+            height: 36
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  text: "VoIP"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - globals.set:
+                  id: current_page
+                  value: '"voip"'
+              - lvgl.widget.hide: voip_kb
+              - script.execute: voip_fill_page
+              - lvgl.page.show: voip_page
         - button:
             id: back_from_settings_btn
-            align: CENTER
-            y: 290
+            align: TOP_MID
+            y: 336
             width: 130
             height: 30
             radius: 10
@@ -3197,7 +4143,490 @@ lvgl:
                   value: '"home"'
               - lvgl.page.show: home_page
 
+    # ------------------------------------------------------------------
+    # WI-FI SETTINGS PAGE
+    # Scan -> pick a network (or type a hidden one) -> password -> Connect.
+    # Uses ESPHome's wifi.configure: the new network is saved to flash and
+    # survives reboots. If it can't join within 30s it automatically goes
+    # back to the network it was on, so a typo can't strand the box.
+    # ------------------------------------------------------------------
+    - id: wifi_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "Wi-Fi"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            x: 10
+            y: 8
+        - button:
+            id: wifi_scan_btn
+            x: 150
+            y: 4
+            width: 80
+            height: 32
+            radius: 8
+            bg_color: 0x3D7BFF
+            widgets:
+              - label:
+                  text: "Scan"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: wifi_kb
+              - script.execute: wifi_start_scan
+        - button:
+            id: wifi_back_btn
+            align: TOP_RIGHT
+            x: -6
+            y: 4
+            width: 76
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Back"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: wifi_kb
+              - globals.set:
+                  id: current_page
+                  value: '"settings"'
+              - lvgl.page.show: settings_page
+        - dropdown:
+            id: wifi_ssid_dropdown
+            x: 10
+            y: 40
+            width: 300
+            height: 34
+            text_font: font_small
+            options:
+              - "Tap Scan to search for networks"
+            dropdown_list:
+              text_font: font_small
+              max_height: 180
+            on_value:
+              - lambda: |-
+                  uint32_t i = lv_dropdown_get_selected(id(wifi_ssid_dropdown)->obj);
+                  if (i < id(wifi_scan_ssids).size()) {
+                    lv_textarea_set_text(id(wifi_ssid_ta), id(wifi_scan_ssids)[i].c_str());
+                  }
+        - textarea:
+            id: wifi_ssid_ta
+            x: 10
+            y: 78
+            width: 145
+            height: 34
+            one_line: true
+            max_length: 32
+            placeholder_text: "Network name"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: wifi_kb
+                  textarea: wifi_ssid_ta
+              - lvgl.widget.show: wifi_kb
+        - textarea:
+            id: wifi_pass_ta
+            x: 165
+            y: 78
+            width: 145
+            height: 34
+            one_line: true
+            password_mode: true
+            max_length: 64
+            placeholder_text: "Password"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: wifi_kb
+                  textarea: wifi_pass_ta
+              - lvgl.widget.show: wifi_kb
+        - button:
+            id: wifi_connect_btn
+            x: 10
+            y: 120
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  text: "Connect"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: wifi_kb
+              - if:
+                  condition:
+                    lambda: 'return strlen(lv_textarea_get_text(id(wifi_ssid_ta))) > 0;'
+                  then:
+                    - lambda: 'lv_label_set_text(id(wifi_page_status), "Joining... screen keeps working, HA may drop briefly");'
+                    - wifi.configure:
+                        ssid: !lambda 'return std::string(lv_textarea_get_text(id(wifi_ssid_ta)));'
+                        password: !lambda 'return std::string(lv_textarea_get_text(id(wifi_pass_ta)));'
+                        save: true
+                        timeout: 30s
+                        on_connect:
+                          - lambda: 'lv_label_set_text(id(wifi_page_status), "Connected and saved.");'
+                          - script.execute: update_wifi_page_status
+                        on_error:
+                          - lambda: 'lv_label_set_text(id(wifi_page_status), "Could not join - back on the previous Wi-Fi");'
+                          - script.execute: update_wifi_page_status
+                  else:
+                    - lambda: 'lv_label_set_text(id(wifi_page_status), "Pick or type a network name first");'
+        - button:
+            id: wifi_showpw_btn
+            x: 112
+            y: 120
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: wifi_showpw_label
+                  text: "Show pw"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  bool hidden = lv_textarea_get_password_mode(id(wifi_pass_ta));
+                  lv_textarea_set_password_mode(id(wifi_pass_ta), !hidden);
+                  lv_label_set_text(id(wifi_showpw_label), hidden ? "Hide pw" : "Show pw");
+        # Goes back to the Wi-Fi from your secrets.yaml (what was flashed).
+        - button:
+            id: wifi_default_btn
+            x: 214
+            y: 120
+            width: 96
+            height: 36
+            radius: 10
+            bg_color: 0x5A6472
+            widgets:
+              - label:
+                  text: "Default"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: wifi_kb
+              - lambda: 'lv_label_set_text(id(wifi_page_status), "Switching to the flashed (secrets) Wi-Fi...");'
+              - wifi.configure:
+                  ssid: !secret wifi_ssid
+                  password: !secret wifi_password
+                  save: true
+                  timeout: 30s
+                  on_connect:
+                    - lambda: 'lv_label_set_text(id(wifi_page_status), "Back on the default Wi-Fi.");'
+                  on_error:
+                    - lambda: 'lv_label_set_text(id(wifi_page_status), "Default Wi-Fi not reachable - kept current");'
+        - label:
+            id: wifi_current_label
+            x: 10
+            y: 166
+            width: 300
+            long_mode: DOT
+            text: "Not connected to Wi-Fi"
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - label:
+            id: wifi_page_status
+            x: 10
+            y: 192
+            width: 300
+            long_mode: WRAP
+            text: "Tap Scan to look for networks"
+            text_font: font_small
+            text_color: 0xFFC107
+        # On-screen keyboard - pops up when a text box is tapped, hides on
+        # its checkmark / close key.
+        - keyboard:
+            id: wifi_kb
+            textarea: wifi_ssid_ta
+            mode: TEXT_LOWER
+            align: BOTTOM_MID
+            width: 320
+            height: 120
+            hidden: true
+            on_ready:
+              - lvgl.widget.hide: wifi_kb
+            on_cancel:
+              - lvgl.widget.hide: wifi_kb
+
+    # ------------------------------------------------------------------
+    # VOIP SETTINGS PAGE
+    # Server must be an IP. Port is separate (NOT "ip:port"). Leave
+    # Domain blank to use the server IP. Leave Password blank to keep
+    # the saved one. Save reboots so the SIP client re-registers.
+    # ------------------------------------------------------------------
+    - id: voip_page
+      bg_color: 0x11151C
+      widgets:
+        - label:
+            text: "VoIP"
+            text_font: font_medium
+            text_color: 0xFFFFFF
+            x: 10
+            y: 8
+        # Fills in the LAN door of the Kamailio gateway from the
+        # vpn-plus-public setup (192.168.8.100, port 5072).
+        - button:
+            id: voip_gateway_preset_btn
+            x: 90
+            y: 4
+            width: 140
+            height: 32
+            radius: 8
+            bg_color: 0x3D7BFF
+            widgets:
+              - label:
+                  text: "Gateway LAN"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  lv_textarea_set_text(id(voip_server_ta), "192.168.8.100");
+                  lv_textarea_set_text(id(voip_port_ta), "5072");
+                  lv_textarea_set_text(id(voip_domain_ta), "");
+                  lv_label_set_text(id(voip_page_status), "Gateway needs an apiu-... user + its password");
+        - button:
+            id: voip_back_btn
+            align: TOP_RIGHT
+            x: -6
+            y: 4
+            width: 76
+            height: 32
+            radius: 8
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  text: "Back"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: voip_kb
+              - globals.set:
+                  id: current_page
+                  value: '"settings"'
+              - lvgl.page.show: settings_page
+        - textarea:
+            id: voip_server_ta
+            x: 10
+            y: 40
+            width: 124
+            height: 34
+            one_line: true
+            max_length: 40
+            accepted_chars: "0123456789."
+            placeholder_text: "Server IP"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: voip_kb
+                  textarea: voip_server_ta
+                  mode: NUMBER
+              - lvgl.widget.show: voip_kb
+        - textarea:
+            id: voip_port_ta
+            x: 138
+            y: 40
+            width: 62
+            height: 34
+            one_line: true
+            max_length: 5
+            accepted_chars: "0123456789"
+            placeholder_text: "Port"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: voip_kb
+                  textarea: voip_port_ta
+                  mode: NUMBER
+              - lvgl.widget.show: voip_kb
+        - textarea:
+            id: voip_domain_ta
+            x: 204
+            y: 40
+            width: 106
+            height: 34
+            one_line: true
+            max_length: 64
+            placeholder_text: "Domain(opt)"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: voip_kb
+                  textarea: voip_domain_ta
+                  mode: TEXT_LOWER
+              - lvgl.widget.show: voip_kb
+        - textarea:
+            id: voip_user_ta
+            x: 10
+            y: 80
+            width: 148
+            height: 34
+            one_line: true
+            max_length: 40
+            placeholder_text: "User / extension"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: voip_kb
+                  textarea: voip_user_ta
+                  mode: TEXT_LOWER
+              - lvgl.widget.show: voip_kb
+        - textarea:
+            id: voip_pass_ta
+            x: 162
+            y: 80
+            width: 148
+            height: 34
+            one_line: true
+            password_mode: true
+            max_length: 64
+            placeholder_text: "Pass (unchanged)"
+            text_font: font_small
+            on_focus:
+              - lvgl.keyboard.update:
+                  id: voip_kb
+                  textarea: voip_pass_ta
+                  mode: TEXT_LOWER
+              - lvgl.widget.show: voip_kb
+        - button:
+            id: voip_save_btn
+            x: 10
+            y: 122
+            width: 148
+            height: 36
+            radius: 10
+            bg_color: 0x2ECC71
+            widgets:
+              - label:
+                  text: "Save & Reboot"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lvgl.widget.hide: voip_kb
+              - if:
+                  condition:
+                    lambda: |-
+                      std::string srv = lv_textarea_get_text(id(voip_server_ta));
+                      int port = atoi(lv_textarea_get_text(id(voip_port_ta)));
+                      int dots = 0;
+                      for (char c : srv) if (c == '.') dots++;
+                      return dots == 3 && port > 0 && port <= 65535 && !id(call_in_progress);
+                  then:
+                    - text.set:
+                        id: sip_server_text
+                        value: !lambda 'return std::string(lv_textarea_get_text(id(voip_server_ta)));'
+                    - text.set:
+                        id: sip_port_text
+                        value: !lambda 'return std::string(lv_textarea_get_text(id(voip_port_ta)));'
+                    - text.set:
+                        id: sip_domain_text
+                        value: !lambda 'return std::string(lv_textarea_get_text(id(voip_domain_ta)));'
+                    - text.set:
+                        id: sip_user_text
+                        value: !lambda 'return std::string(lv_textarea_get_text(id(voip_user_ta)));'
+                    - if:
+                        condition:
+                          lambda: 'return strlen(lv_textarea_get_text(id(voip_pass_ta))) > 0;'
+                        then:
+                          - text.set:
+                              id: sip_pass_text
+                              value: !lambda 'return std::string(lv_textarea_get_text(id(voip_pass_ta)));'
+                    - lambda: 'lv_label_set_text(id(voip_page_status), "Saved - rebooting...");'
+                    - delay: 1500ms
+                    - lambda: 'App.safe_reboot();'
+                  else:
+                    - lambda: 'lv_label_set_text(id(voip_page_status), "Need a server IP like 192.168.8.100 and a port (no call active)");'
+        - button:
+            id: voip_showpw_btn
+            x: 162
+            y: 122
+            width: 148
+            height: 36
+            radius: 10
+            bg_color: 0x1F2632
+            widgets:
+              - label:
+                  id: voip_showpw_label
+                  text: "Show password"
+                  align: CENTER
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+            on_click:
+              - lambda: |-
+                  bool hidden = lv_textarea_get_password_mode(id(voip_pass_ta));
+                  lv_textarea_set_password_mode(id(voip_pass_ta), !hidden);
+                  lv_label_set_text(id(voip_showpw_label), hidden ? "Hide password" : "Show password");
+        - label:
+            id: voip_current_label
+            x: 10
+            y: 166
+            width: 300
+            long_mode: DOT
+            text: "Now: --"
+            text_font: font_small
+            text_color: 0xB7C0CC
+        - label:
+            id: voip_reg_label
+            x: 10
+            y: 188
+            text: "SIP: NOT registered"
+            text_font: font_small
+            text_color: 0xE74C3C
+        - label:
+            id: voip_page_status
+            x: 10
+            y: 210
+            width: 300
+            long_mode: DOT
+            text: "Leave Domain / Password blank to keep them"
+            text_font: font_small
+            text_color: 0xFFC107
+        - keyboard:
+            id: voip_kb
+            textarea: voip_server_ta
+            mode: NUMBER
+            align: BOTTOM_MID
+            width: 320
+            height: 120
+            hidden: true
+            on_ready:
+              - lvgl.widget.hide: voip_kb
+            on_cancel:
+              - lvgl.widget.hide: voip_kb
+
 switch:
+  #── CCTV floating window on the home screen — also controllable from HA
+  # (e.g. pop the camera up when the doorbell rings). ──
+  - platform: template
+    id: cctv_float_switch
+    name: "CCTV Floating Window"
+    icon: mdi:cctv
+    lambda: 'return id(cctv_float_on);'
+    turn_on_action:
+      - globals.set:
+          id: cctv_float_on
+          value: 'true'
+      - script.execute: cctv_float_apply
+    turn_off_action:
+      - globals.set:
+          id: cctv_float_on
+          value: 'false'
+      - script.execute: cctv_float_apply
+
   #── IR device mirrors — ported from old.yaml's sw_menu_* pattern. Each
   # mirrors the real HA switch: switch.toggle sends the command, and
   # on_turn_on/on_turn_off recolor the IR page button to match whatever
@@ -3405,6 +4834,210 @@ text:
       - lvgl.label.update:
           id: speed_dial_4_label_widget
           text: !lambda 'return x;'
+  #── VoIP account (Settings > VoIP on the screen, or edit here in HA) ────
+  # Changes take effect after a reboot (the screen's Save button reboots).
+  - platform: template
+    name: "VoIP Server IP"
+    id: sip_server_text
+    icon: "mdi:server-network"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 40
+    initial_value: "${sip_server_default}"
+  - platform: template
+    name: "VoIP Port"
+    id: sip_port_text
+    icon: "mdi:numeric"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 5
+    initial_value: "${sip_port_default}"
+  - platform: template
+    name: "VoIP Domain"
+    id: sip_domain_text
+    icon: "mdi:domain"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 64
+    initial_value: ""
+  - platform: template
+    name: "VoIP Username"
+    id: sip_user_text
+    icon: "mdi:account"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 40
+    initial_value: ""
+  # Write-only VoIP password for Home Assistant: type a new password and
+  # it's copied into the saved (hidden) password, then this box clears
+  # itself so the password never sits in HA's state/history.
+  - platform: template
+    name: "VoIP New Password"
+    id: ha_sip_password
+    icon: "mdi:form-textbox-password"
+    entity_category: config
+    mode: password
+    optimistic: true
+    restore_value: false
+    min_length: 0
+    max_length: 64
+    initial_value: ""
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !x.empty();'
+          then:
+            - text.set:
+                id: sip_pass_text
+                value: !lambda 'return x;'
+            - text.set:
+                id: ha_sip_password
+                value: ""
+            - logger.log: "VoIP: new password saved - press Apply VoIP Settings"
+  #── Wi-Fi fields for Home Assistant (used by "Connect to New Wi-Fi") ──
+  - platform: template
+    name: "Wi-Fi New Network"
+    id: ha_wifi_ssid
+    icon: "mdi:wifi-plus"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: false
+    min_length: 0
+    max_length: 32
+    initial_value: ""
+  - platform: template
+    name: "Wi-Fi New Password"
+    id: ha_wifi_password
+    icon: "mdi:form-textbox-password"
+    entity_category: config
+    mode: password
+    optimistic: true
+    restore_value: false
+    min_length: 0
+    max_length: 64
+    initial_value: ""
+  # The saved SIP password itself - internal, never readable from HA.
+  - platform: template
+    id: sip_pass_text
+    internal: true
+    mode: password
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 64
+    initial_value: ""
+
+  # ── Messages app ──────────────────────────────────────────────
+  # Editable on the screen (Messages page) and in HA under this device's
+  # Configuration. SEND reads these when you send from the HA device page.
+  - platform: template
+    name: "Message To"
+    id: msg_to_ext
+    icon: "mdi:message-arrow-right-outline"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 16
+    initial_value: ""
+  - platform: template
+    name: "Message Compose"
+    id: msg_compose
+    icon: "mdi:message-text-outline"
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 255
+    initial_value: ""
+  # Inbox mirrors — Home Assistant writes the newest 5 texts here; each one
+  # refreshes its label on the Messages page. They also show in HA, so you
+  # can read the inbox from the ESP's device page.
+  - platform: template
+    name: "Inbox Line 1"
+    id: msg_inbox_1
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 160
+    initial_value: ""
+    on_value:
+      - lambda: |-
+          lv_label_set_text(id(msg_line_1), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(msg_line_1), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_clear_flag(id(msg_line_1), LV_OBJ_FLAG_HIDDEN);
+  - platform: template
+    name: "Inbox Line 2"
+    id: msg_inbox_2
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 160
+    initial_value: ""
+    on_value:
+      - lambda: |-
+          lv_label_set_text(id(msg_line_2), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(msg_line_2), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_clear_flag(id(msg_line_2), LV_OBJ_FLAG_HIDDEN);
+  - platform: template
+    name: "Inbox Line 3"
+    id: msg_inbox_3
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 160
+    initial_value: ""
+    on_value:
+      - lambda: |-
+          lv_label_set_text(id(msg_line_3), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(msg_line_3), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_clear_flag(id(msg_line_3), LV_OBJ_FLAG_HIDDEN);
+  - platform: template
+    name: "Inbox Line 4"
+    id: msg_inbox_4
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 160
+    initial_value: ""
+    on_value:
+      - lambda: |-
+          lv_label_set_text(id(msg_line_4), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(msg_line_4), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_clear_flag(id(msg_line_4), LV_OBJ_FLAG_HIDDEN);
+  - platform: template
+    name: "Inbox Line 5"
+    id: msg_inbox_5
+    icon: "mdi:message-text"
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 160
+    initial_value: ""
+    on_value:
+      - lambda: |-
+          lv_label_set_text(id(msg_line_5), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(msg_line_5), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_clear_flag(id(msg_line_5), LV_OBJ_FLAG_HIDDEN);
 
 select:
   # Button and text color pickers for all four speed dial buttons, exposed
