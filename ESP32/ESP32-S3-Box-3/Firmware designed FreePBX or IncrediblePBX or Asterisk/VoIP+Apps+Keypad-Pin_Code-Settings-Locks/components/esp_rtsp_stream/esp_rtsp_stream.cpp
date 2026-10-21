@@ -633,8 +633,14 @@ void RtspMjpeg::decode_loop_() {
       this->front_stride_ = this->back_stride_;
     }
     if (++this->decoded_frames_ == 1) {
-      ESP_LOGI(TAG, "First frame: %dx%d stream -> %dx%d output, decoded in %u ms", this->ready_width_,
-               this->ready_height_, this->back_width_, this->back_height_, (unsigned) this->last_decode_ms_.load());
+      ESP_LOGI(TAG, "%s first frame: %dx%d stream -> %dx%d output, decoded in %u ms", this->parsed_url_.uri.c_str(),
+               this->ready_width_, this->ready_height_, this->back_width_, this->back_height_,
+               (unsigned) this->last_decode_ms_.load());
+      if (this->last_decode_ms_ > 250) {
+        ESP_LOGW(TAG, "%s: %dx%d frames are too big for this chip (%u ms each). Lower the stream resolution "
+                      "(about 320x240 to 640x480)", this->parsed_url_.uri.c_str(), this->ready_width_,
+                 this->ready_height_, (unsigned) this->last_decode_ms_.load());
+      }
     }
     this->new_frame_ = true;
   }
