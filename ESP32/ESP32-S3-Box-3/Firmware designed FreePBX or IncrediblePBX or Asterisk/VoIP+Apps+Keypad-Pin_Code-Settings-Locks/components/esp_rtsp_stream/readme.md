@@ -149,3 +149,22 @@ disconnects after `idle_timeout` (default `10s`) off screen, so several cameras 
 all use Wi-Fi at once. `idle_timeout: 0s` restores the always-connected behaviour.
 `set_lvgl_canvas()`, `set_output_size()` and `set_max_fps()` can be called at runtime
 (from lambdas) to move one stream between canvases.
+
+## SD-card recording (added)
+
+Each stream can record its JPEG frames, untouched, to a Motion-JPEG AVI file (plays in VLC):
+
+```yaml
+esp_rtsp_stream:
+  - id: door
+    url: http://192.168.8.212:9081
+    record_dir: /sdcard/cctv      # needs a mounted card (see cctv_sdcard)
+    record_label: "DOOR"          # file name: <YYYYMMDD_HHMMSS>_DOOR.avi
+    record_fps: 2                 # frames written per second
+    record_segment: 5min          # a new file every 5 minutes
+```
+
+`id(door).start_recording()` / `stop_recording()` / `is_recording()` / `is_writing()` from lambdas.
+While recording, the stream stays connected even when it isn't on screen, and frames are not
+decoded unless they are shown. Data is committed to the card every 5 s; a new file starts after
+every reconnect so playback speed stays right.

@@ -30,6 +30,10 @@ CONF_MAX_FRAME_SIZE = "max_frame_size"
 CONF_LOG_FRAME_INFO = "log_frame_info"
 CONF_LVGL_CANVAS = "lvgl_canvas"
 CONF_IDLE_TIMEOUT = "idle_timeout"
+CONF_RECORD_DIR = "record_dir"
+CONF_RECORD_LABEL = "record_label"
+CONF_RECORD_FPS = "record_fps"
+CONF_RECORD_SEGMENT = "record_segment"
 
 
 def _lvgl_canvas_id(value):
@@ -126,6 +130,14 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(
                 CONF_IDLE_TIMEOUT, default="10s"
             ): cv.positive_time_period_milliseconds,
+            # SD-card recording (start/stop from lambdas: id(cam).start_recording()).
+            cv.Optional(CONF_RECORD_DIR, default="/sdcard/cctv"): cv.string_strict,
+            cv.Optional(CONF_RECORD_LABEL): cv.string_strict,
+            cv.Optional(CONF_RECORD_FPS, default=5): cv.int_range(min=1, max=30),
+            cv.Optional(CONF_RECORD_SEGMENT, default="5min"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(seconds=10), max=cv.TimePeriod(minutes=60)),
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -176,6 +188,10 @@ async def to_code(config):
     cg.add(var.set_task_cores(profile["network_core"], profile["decode_core"]))
     cg.add(var.set_log_frame_info(config[CONF_LOG_FRAME_INFO]))
     cg.add(var.set_idle_timeout(config[CONF_IDLE_TIMEOUT].total_milliseconds))
+    cg.add(var.set_record_dir(config[CONF_RECORD_DIR].rstrip("/")))
+    cg.add(var.set_record_label(config.get(CONF_RECORD_LABEL, str(config[CONF_ID]))))
+    cg.add(var.set_record_fps(config[CONF_RECORD_FPS]))
+    cg.add(var.set_record_segment(config[CONF_RECORD_SEGMENT].total_milliseconds))
     if CONF_DISPLAY_ID in config:
         disp = await cg.get_variable(config[CONF_DISPLAY_ID])
         cg.add(var.set_display(disp))

@@ -18,6 +18,7 @@
 #include <lvgl.h>
 #endif
 
+#include "avi_writer.h"
 #include "rfc2435.h"
 #include "rtsp_client.h"
 
@@ -47,6 +48,11 @@ class RtspMjpeg : public Component {
     this->box_height_ = height;
   }
   void set_rotation(int degrees) { this->rotation_ = degrees; }
+  /// How the picture fits its box: 0 = FIT (keep shape, black bars, never enlarge),
+  /// 1 = STRETCH (fill the box exactly, shape may distort), 2 = CROP (fill the box,
+  /// keep shape, centre-crop the overflow; may enlarge). Runtime-switchable per view.
+  void set_aspect_mode(int mode) { this->aspect_mode_ = mode; }
+  int get_aspect_mode() const { return this->aspect_mode_.load(); }
   void set_max_frame_size(size_t bytes) { this->max_frame_size_ = bytes; }
   void set_task_cores(int network_core, int decode_core) {
     this->network_core_ = network_core;
@@ -55,6 +61,22 @@ class RtspMjpeg : public Component {
   void set_log_frame_info(bool enabled) { this->log_frame_info_ = enabled; }
   /// Disconnect after the stream has been off screen this long (LVGL canvas mode); 0 = stay connected.
   void set_idle_timeout(uint32_t ms) { this->idle_timeout_ms_ = ms; }
+
+  // ---- SD-card recording (Motion-JPEG AVI) ----
+  void set_record_dir(const std::string &dir) { this->rec_dir_ = dir; }
+  void set_record_label(const std::string &label) { this->rec_label_ = label; }
+  void set_record_fps(int fps) { this->record_fps_ = fps; }
+  void set_record_segment(uint32_t ms) { this->rec_segment_ms_ = ms; }
+  /// Starts (or restarts, in a new file) recording. Files are <dir>/<YYYYMMDD_HHMMSS>_<label>.avi and are
+  /// split every record_segment. The stream stays connected while recording, even off screen.
+  void start_recording();
+  void stop_recording() { this->rec_wanted_ = false; }
+  /// True while recording is switched on (even between files or while the camera reconnects).
+  bool is_recording() const { return this->rec_wanted_; }
+  /// True while a file is actually open and receiving frames.
+  bool is_writing() const { return this->rec_writing_; }
+  uint32_t get_recorded_frames() const { return this->rec_frames_total_; }
+  uint32_t get_record_errors() const { return this->rec_errors_; }
 #ifdef USE_DISPLAY
   void set_display(display::Display *display) { this->display_ = display; }
 
@@ -105,6 +127,11 @@ class RtspMjpeg : public Component {
   bool run_http_session_();
   /// True once nothing has shown this stream for idle_timeout; marks the session as paused.
   bool should_pause_();
+  /// Network task only. With a frame: writes it if due. With nullptr: closes/flushes as needed.
+  void service_recording_(const uint8_t *jpeg, size_t len, int width, int height);
+  std::string recording_path_();
+  /// vTaskDelay that keeps servicing the recorder.
+  void idle_delay_(uint32_t ms);
   bool handle_rtp_(uint16_t len);
   void frame_complete_(size_t jpeg_len, int width, int height);
 
@@ -124,6 +151,7 @@ class RtspMjpeg : public Component {
   std::string username_;
   std::string password_;
   int max_fps_{10};
+  std::atomic<int> aspect_mode_{0};
   int box_width_{0};
   int box_height_{0};
   int rotation_{0};
@@ -132,6 +160,23 @@ class RtspMjpeg : public Component {
   int decode_core_{1};
   bool log_frame_info_{true};
   uint32_t idle_timeout_ms_{10000};
+
+  // Recording. Settings are written by the main loop, the AviWriter is used by the network task only.
+  std::mutex rec_mutex_;
+  std::string rec_dir_{"/sdcard/cctv"};
+  std::string rec_label_{"cam"};
+  int record_fps_{5};
+  uint32_t rec_segment_ms_{5 * 60 * 1000};
+  std::atomic<bool> rec_wanted_{false};
+  std::atomic<uint32_t> rec_generation_{0};
+  uint32_t rec_open_generation_{0};
+  std::atomic<bool> rec_writing_{false};
+  std::atomic<uint32_t> rec_frames_total_{0};
+  std::atomic<uint32_t> rec_errors_{0};
+  uint32_t rec_last_ms_{0};
+  uint32_t rec_last_flush_ms_{0};
+  uint32_t rec_retry_after_ms_{0};
+  AviWriter avi_;
   uint32_t unwanted_since_ms_{0};
   bool paused_{false};
 #ifdef USE_DISPLAY

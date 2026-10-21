@@ -1,10 +1,14 @@
 #include "esp_rtsp_stream.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <strings.h>
+
+#include <ctime>
+#include <sys/stat.h>
 
 #include <esp_heap_caps.h>
 
@@ -94,7 +98,8 @@ void RtspMjpeg::loop() {
     const uint32_t decoded = this->decoded_frames_;
     const float fps = (decoded - this->last_stats_decoded_) * 1000.0f / (now - this->last_stats_ms_);
     if (this->streaming_) {
-      ESP_LOGI(TAG, "%dx%d stream -> %dx%d, %.1f fps shown, decode %u ms, %u dropped, %u corrupt", this->stream_width_,
+      ESP_LOGI(TAG, "%s: %dx%d stream -> %dx%d, %.1f fps shown, decode %u ms, %u dropped, %u corrupt",
+               this->parsed_url_.uri.c_str(), this->stream_width_,
                this->stream_height_, this->front_width_, this->front_height_, fps,
                (unsigned) this->last_decode_ms_.load(), (unsigned) this->dropped_frames_.load(),
                (unsigned) this->corrupt_frames_.load());
@@ -115,6 +120,8 @@ void RtspMjpeg::dump_config() {
   ESP_LOGCONFIG(TAG, "  Rotation: %d", this->rotation_);
   ESP_LOGCONFIG(TAG, "  Max frame size: %u bytes", (unsigned) this->max_frame_size_);
   ESP_LOGCONFIG(TAG, "  Idle disconnect: %u ms", (unsigned) this->idle_timeout_ms_);
+  ESP_LOGCONFIG(TAG, "  Recording: %s/*_%s.avi, %d fps, %u s files", this->rec_dir_.c_str(), this->rec_label_.c_str(),
+                this->record_fps_, (unsigned) (this->rec_segment_ms_ / 1000));
   ESP_LOGCONFIG(TAG, "  Tasks: network on core %d, decode on core %d", this->network_core_, this->decode_core_);
 }
 
@@ -127,12 +134,12 @@ void RtspMjpeg::network_loop_() {
   uint32_t backoff_ms = 1000;
   while (true) {
     if (!network::is_connected()) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      this->idle_delay_(1000);
       continue;
     }
-    // Nothing on screen shows this stream: stay disconnected until something does.
-    if (!this->frames_wanted_ && this->idle_timeout_ms_ > 0) {
-      vTaskDelay(pdMS_TO_TICKS(200));
+    // Nothing on screen shows this stream and it isn't recording: stay disconnected.
+    if (!this->frames_wanted_ && !this->rec_wanted_ && this->idle_timeout_ms_ > 0) {
+      this->idle_delay_(200);
       continue;
     }
     this->unwanted_since_ms_ = 0;
@@ -141,14 +148,19 @@ void RtspMjpeg::network_loop_() {
     this->conn_.close();
     this->assembler_.abandon();
     this->streaming_ = false;
+    // One file per continuous stretch of video: a gap would play back at the wrong speed.
+    if (this->avi_.is_open()) {
+      this->avi_.close();
+      this->rec_writing_ = false;
+    }
     if (this->paused_) {
       ESP_LOGI(TAG, "%s not on screen, disconnected", this->parsed_url_.uri.c_str());
       backoff_ms = 1000;
       continue;
     }
-    backoff_ms = got_frames ? 1000 : std::min<uint32_t>(backoff_ms * 2, 30000);
-    ESP_LOGW(TAG, "Stream stopped, reconnecting in %u s", (unsigned) (backoff_ms / 1000));
-    vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+    backoff_ms = got_frames ? 1000 : std::min<uint32_t>(backoff_ms * 2, 10000);
+    ESP_LOGW(TAG, "%s stopped, reconnecting in %u s", this->parsed_url_.uri.c_str(), (unsigned) (backoff_ms / 1000));
+    this->idle_delay_(backoff_ms);
   }
 }
 
@@ -549,7 +561,8 @@ bool RtspMjpeg::run_http_session_() {
 }
 
 bool RtspMjpeg::should_pause_() {
-  if (this->idle_timeout_ms_ == 0 || this->frames_wanted_) {
+  this->service_recording_(nullptr, 0, 0, 0);
+  if (this->idle_timeout_ms_ == 0 || this->frames_wanted_ || this->rec_wanted_) {
     this->unwanted_since_ms_ = 0;
     return false;
   }
@@ -569,6 +582,15 @@ void RtspMjpeg::frame_complete_(size_t jpeg_len, int width, int height) {
   this->session_frames_++;
   this->stream_width_ = width;
   this->stream_height_ = height;
+  // The buffer stays ours until this function returns, even if it is handed to the decoder below.
+  const uint8_t *jpeg = this->jpeg_buffers_[this->fill_index_];
+  struct RecordOnExit {
+    RtspMjpeg *self;
+    const uint8_t *jpeg;
+    size_t len;
+    int w, h;
+    ~RecordOnExit() { self->service_recording_(jpeg, len, w, h); }
+  } record_on_exit{this, jpeg, jpeg_len, width, height};
   if (!this->frames_wanted_)
     return;
 
@@ -648,32 +670,57 @@ void RtspMjpeg::decode_loop_() {
 
 RtspMjpeg::OutputPlan RtspMjpeg::plan_output_(int src_width, int src_height) const {
   const bool swap = this->rotation_ == 90 || this->rotation_ == 270;
+  const int mode = this->aspect_mode_.load();
   float scale = 1.0f;
+  int target_w = src_width;
+  int target_h = src_height;
   if (this->box_width_ > 0 && this->box_height_ > 0) {
     // The box is in display orientation; compare it with the source before rotation.
     const int box_w = swap ? this->box_height_ : this->box_width_;
     const int box_h = swap ? this->box_width_ : this->box_height_;
-    scale = std::min({1.0f, static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height});
+    if (mode == 1) {
+      // STRETCH: fill the box exactly; the axes scale independently in finish_frame_().
+      target_w = box_w;
+      target_h = box_h;
+      scale = std::min(static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height);
+    } else if (mode == 2) {
+      // CROP (fill): scale to cover the box, keeping the shape (enlarging if the stream
+      // is smaller than the box). update_lvgl_canvas_() centre-crops the overflow.
+      scale = std::max(static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height);
+      target_w = std::max(1, static_cast<int>(src_width * scale + 0.5f));
+      target_h = std::max(1, static_cast<int>(src_height * scale + 0.5f));
+    } else {
+      // FIT: keep the shape, fit inside the box, never enlarge.
+      scale = std::min({1.0f, static_cast<float>(box_w) / src_width, static_cast<float>(box_h) / src_height});
+      target_w = std::max(1, static_cast<int>(src_width * scale + 0.01f));
+      target_h = std::max(1, static_cast<int>(src_height * scale + 0.01f));
+    }
   }
 
-  // The exact aspect-preserving size. The hardware scalers can only get close to it, so they
-  // aim at the next size up and resize_rgb565() closes the last few pixels.
+  // The exact size the frame is finished at. The hardware scalers can only get close to
+  // it, so they aim at the next size up and resize_rgb565() closes the last few pixels.
   OutputPlan plan;
-  plan.target_width = std::max(1, static_cast<int>(src_width * scale + 0.01f));
-  plan.target_height = std::max(1, static_cast<int>(src_height * scale + 0.01f));
+  plan.target_width = target_w;
+  plan.target_height = target_h;
 #ifdef USE_ESP_RTSP_STREAM_HW_JPEG
   // PPA scale factors have 1/16 resolution.
   plan.scale = std::min(1.0f, std::max(1.0f / 16, std::ceil(scale * 16 - 0.01f) / 16));
   plan.scaled_width = static_cast<int>(plan.scale * src_width);
   plan.scaled_height = static_cast<int>(plan.scale * src_height);
 #else
-  // Only ask esp_new_jpeg for the 1/2, 1/4, 1/8 reductions a JPEG decoder does natively, and only when the
-  // result stays a multiple of 8 and no smaller than the target; finish_frame_() does the rest.
+  // esp_new_jpeg's scaler smears the picture at arbitrary ratios (seen with a 320x240 stream
+  // in the 320x200 single view: the decoder was asked for 272x200 and produced horizontal
+  // streaks, while the grid's exact 1:2 request was clean). Only ever ask the decoder for an
+  // exact 1:1, 1:2, 1:4 or 1:8 reduction — the same factor on both axes, and only when the
+  // source divides exactly — choosing the strongest reduction that still covers the target.
+  // finish_frame_() (halving + bilinear resize) covers the rest of the way to the target.
   int factor = 1;
-  for (int f = 2; f <= 8; f *= 2) {
-    if (src_width % (8 * f) == 0 && src_height % (8 * f) == 0 && src_width / f >= plan.target_width &&
-        src_height / f >= plan.target_height)
+  for (int f = 8; f >= 2; f /= 2) {
+    if (src_width % f == 0 && src_height % f == 0 && src_width / f >= plan.target_width &&
+        src_height / f >= plan.target_height) {
       factor = f;
+      break;
+    }
   }
   plan.scale = scale;
   plan.scaled_width = src_width / factor;
@@ -882,8 +929,9 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
     jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
     cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
     if (plan.scaled_width != src_width || plan.scaled_height != src_height) {
-      cfg.scale.width = plan.scaled_width;
-      cfg.scale.height = plan.scaled_height;
+      // 0 leaves that axis unscaled (an unscaled source size may not be a multiple of 8).
+      cfg.scale.width = plan.scaled_width != src_width ? plan.scaled_width : 0;
+      cfg.scale.height = plan.scaled_height != src_height ? plan.scaled_height : 0;
     }
     cfg.rotate = this->rotation_ == 90    ? JPEG_ROTATE_90D
                  : this->rotation_ == 180 ? JPEG_ROTATE_180D
@@ -927,6 +975,16 @@ bool RtspMjpeg::decode_frame_(const uint8_t *jpeg, size_t len, int src_width, in
       plan.stage_height = swap ? src_width : src_height;
     }
 
+    // Never decode a huge frame at full size: a few of those use up PSRAM for every other stream.
+    if (err == JPEG_ERR_OK && out_len > 2 * 1024 * 1024) {
+      const uint32_t now = millis();
+      if (now - this->last_warning_ms_ > 10000) {
+        this->last_warning_ms_ = now;
+        ESP_LOGW(TAG, "%s: %dx%d frame would need %d bytes to decode; lower the stream resolution",
+                 this->parsed_url_.uri.c_str(), src_width, src_height, out_len);
+      }
+      err = JPEG_ERR_NO_MEM;
+    }
     // Decode straight into the frame buffer when the decoder hits the exact size, else into scaled_.
     const bool exact = plan.stage_width == plan.out_width && plan.stage_height == plan.out_height;
     uint8_t *&out = exact ? this->rgb_[back] : this->scaled_;
@@ -1009,6 +1067,104 @@ void RtspMjpeg::update_lvgl_canvas_(lv_obj_t *canvas) {
   lv_obj_invalidate(canvas);
 }
 #endif
+
+// ---------------------------------------------------------------------------------------------------------------
+// Recording
+
+void RtspMjpeg::start_recording() {
+  this->rec_generation_++;  // a new file even if already recording
+  this->rec_retry_after_ms_ = 0;
+  this->rec_wanted_ = true;
+}
+
+std::string RtspMjpeg::recording_path_() {
+  std::string dir, label;
+  {
+    std::lock_guard<std::mutex> lock(this->rec_mutex_);
+    dir = this->rec_dir_;
+    label = this->rec_label_;
+  }
+  for (char &c : label) {
+    if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
+      c = '_';
+  }
+  mkdir(dir.c_str(), 0777);  // usually exists already
+  char stamp[32];
+  time_t now = ::time(nullptr);
+  struct tm tm;
+  localtime_r(&now, &tm);
+  if (tm.tm_year + 1900 >= 2020) {
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+  } else {
+    snprintf(stamp, sizeof(stamp), "nodate_%010u", (unsigned) millis());  // clock not set yet
+  }
+  return dir + "/" + stamp + "_" + label + ".avi";
+}
+
+void RtspMjpeg::service_recording_(const uint8_t *jpeg, size_t len, int width, int height) {
+  const uint32_t now = millis();
+  if (!this->rec_wanted_ || (this->avi_.is_open() && this->rec_open_generation_ != this->rec_generation_)) {
+    if (this->avi_.is_open()) {
+      this->avi_.close();
+      this->rec_writing_ = false;
+    }
+    if (!this->rec_wanted_)
+      return;
+  }
+  if (this->avi_.is_open() && now - this->rec_last_flush_ms_ >= 5000) {
+    this->avi_.flush();
+    this->rec_last_flush_ms_ = now;
+  }
+  if (jpeg == nullptr || len == 0)
+    return;
+
+  // Rate limit to record_fps, keeping the average rate (a frame may come up to a quarter interval early).
+  const uint32_t interval = 1000 / std::max(1, this->record_fps_);
+  if (this->avi_.is_open() && now - this->rec_last_ms_ + interval / 4 < interval)
+    return;
+
+  // Start a new file every record_segment (or when the index is full).
+  if (this->avi_.is_open() && (this->avi_.full() || this->avi_.elapsed_ms(now) >= this->rec_segment_ms_)) {
+    this->avi_.close();
+    this->rec_writing_ = false;
+  }
+  if (!this->avi_.is_open()) {
+    if (static_cast<int32_t>(now - this->rec_retry_after_ms_) < 0)
+      return;
+    const uint32_t max_frames =
+        static_cast<uint32_t>(static_cast<uint64_t>(this->rec_segment_ms_) * this->record_fps_ / 1000) * 5 / 4 + 32;
+    const std::string path = this->recording_path_();
+    if (!this->avi_.open(path, max_frames)) {
+      this->rec_errors_++;
+      this->rec_retry_after_ms_ = now + 10000;  // e.g. no card yet: try again later
+      return;
+    }
+    ESP_LOGI(TAG, "Recording %s to %s", this->parsed_url_.uri.c_str(), path.c_str());
+    this->rec_open_generation_ = this->rec_generation_;
+    this->rec_last_flush_ms_ = now;
+    this->rec_writing_ = true;
+  }
+  if (!this->avi_.add(jpeg, len, width, height, now)) {
+    this->avi_.close();
+    this->rec_writing_ = false;
+    this->rec_errors_++;
+    this->rec_retry_after_ms_ = now + 10000;  // card full/removed: the SD housekeeping may free space
+    return;
+  }
+  this->rec_last_ms_ = now;
+  this->rec_frames_total_++;
+}
+
+void RtspMjpeg::idle_delay_(uint32_t ms) {
+  while (true) {
+    this->service_recording_(nullptr, 0, 0, 0);
+    const uint32_t step = std::min<uint32_t>(ms, 200);
+    vTaskDelay(pdMS_TO_TICKS(step));
+    if (ms <= step)
+      break;
+    ms -= step;
+  }
+}
 
 }  // namespace esp_rtsp_stream
 }  // namespace esphome
