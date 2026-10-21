@@ -11,7 +11,7 @@ An [ESPHome](https://esphome.io/) configuration that turns an **M5Stack / Espres
 - ⚙️ On-device settings: volume, backlight, mute, auto-answer, PIN lock toggle
 - 🖥️ A full [LVGL](https://esphome.io/components/lvgl) touchscreen UI (home screen, in-call screen, lights, IR menu, settings, PIN pad)
 - 🔋 Battery voltage/percentage reporting, Wi-Fi/HA connection status icons, live clock
-- 🔴REC CCTV with Floating Window (also added 4 channel grid cctv)
+- 🔴REC CCTV with Floating Window (also added 4 channel grid cctv) you can control the cameras and floating windows from HA Devices and Service Panel so you dont need to touch ESP screen.
 - 💡 Home Assistant doesn't need to be Online/Active for VOIP CALLS to work, the server can be power off/offline and still place and accept calls since its coming from FreePBX / IncrediblePBX which you need to install and host yourself its not included in this as well as your own voip provider. For Local Calls/Intercom no voip provider is needed. if you have Home Assistant APPS you should still be able to install asterisk and get local/intercom calls working that away (which will need HA to be online/active/power on since HA is hosting it once you install and set it up) and program your own voip provider if you know how to do all that, i use FreePBX / IncrediblePBX cause i know that.
 - <b>❌ MIC MUTE / MICROPHONE MUTE BUTTON DOSE NOT WORK YET, you cant mute calls, if you mute for any reason, not in call, in a call, etc, you have to reboot for callers to hear you.</b>
 
