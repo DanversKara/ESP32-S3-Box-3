@@ -26,14 +26,14 @@ substitutions:
   # motionEye's MJPEG streaming port instead (plain HTTP multipart MJPEG).
   # Also accepts rtsp:// URLs for cameras that offer MJPEG over RTSP.
   # If you turn on motionEye stream authentication, use
-  # http://user:pass@192.168.8.212:9081/ (Basic auth).
+  # http://user:pass@192.168.8.238:9081/ (Basic auth).
   # Four camera slots — all point at the same stream for now; change each
   # URL/name to your real cameras. Names show on the CCTV page, the grid and
   # the HA "CCTV Camera" select (keep them unique).
-  cam1_url: "http://192.168.8.212:9081"
-  cam2_url: "http://192.168.8.212:9084"
-  cam3_url: "http://192.168.8.212:9085"
-  cam4_url: "http://192.168.8.212:9081"   # same camera as cam1 for now
+  cam1_url: "http://192.168.8.238:9081"
+  cam2_url: "http://192.168.8.238:9084"
+  cam3_url: "http://192.168.8.238:9085"
+  cam4_url: "http://192.168.8.238:9081"   # same camera as cam1 for now
   cam1_name: "DOOR"
   cam2_name: "WINDOW"
   cam3_name: "PARKING LOT"

@@ -1,17 +1,11 @@
-# v5-messages-cctv — v4 + internal-RAM reserve fix for the OOM crashes
+# v5.1-messages-cctv — v4 + 128 KB internal-RAM reserve + motionEye at .238
 
-Builds on v4. **One change only:** `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`
-raised 65536 -> 131072 in the `esp32:` sdkconfig section.
-
-Why: v4 runtime logs showed internal DMA RAM exhaustion - two AVI write
-failures and repeated display `spi: Transmit failed - err 101` under
-multi-camera load, then TWO out-of-memory aborts in the SIP client
-(std::string allocation failed, core 1) within one day. PSRAM (16 MB) was
-never the constraint; the small internal pool shared by the SD/display/
-WiFi DMA drivers was. The higher reserve forces ordinary allocations out
-to PSRAM earlier and keeps 128 KB of internal RAM free for those drivers.
-
-Everything else is byte-identical to v4 (verified by diff: line 202 only). **The floating window is gone completely** — not
+Two changes on top of v4:
+1. `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 65536 -> 131072 (line 202) -
+   fixes the internal-DMA-RAM exhaustion behind the err-101 SD/display
+   failures and the two SIP out-of-memory crashes on 2026-10-21.
+2. Camera URLs point at motionEye on **192.168.8.238** (the .212 in the
+   original upload is stale - flashing it left the video black). **The floating window is gone completely** — not
 hidden, removed. Everything else (VoIP, messages, lights, settings…) is
 byte-for-byte untouched.
 
