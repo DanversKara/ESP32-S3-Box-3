@@ -1,8 +1,17 @@
-# v4-messages-cctv — v6 CCTV design + SD recording, in the all-in-one firmware
+# v5-messages-cctv — v4 + internal-RAM reserve fix for the OOM crashes
 
-Builds on v3 (the v6-design port). This version adds **SD card
-recording** and makes the **red-circle button a REC button** on the
-CCTV page. **The floating window is gone completely** — not
+Builds on v4. **One change only:** `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`
+raised 65536 -> 131072 in the `esp32:` sdkconfig section.
+
+Why: v4 runtime logs showed internal DMA RAM exhaustion - two AVI write
+failures and repeated display `spi: Transmit failed - err 101` under
+multi-camera load, then TWO out-of-memory aborts in the SIP client
+(std::string allocation failed, core 1) within one day. PSRAM (16 MB) was
+never the constraint; the small internal pool shared by the SD/display/
+WiFi DMA drivers was. The higher reserve forces ordinary allocations out
+to PSRAM earlier and keeps 128 KB of internal RAM free for those drivers.
+
+Everything else is byte-identical to v4 (verified by diff: line 202 only). **The floating window is gone completely** — not
 hidden, removed. Everything else (VoIP, messages, lights, settings…) is
 byte-for-byte untouched.
 
@@ -59,7 +68,7 @@ byte-for-byte untouched.
 ## Install
 
 1. Back up your current device folder.
-2. Copy `v4-messages-cctv.yaml` in (keep your `secrets.yaml`).
+2. Copy `v5-messages-cctv.yaml` in (keep your `secrets.yaml`).
 3. **Replace the whole `components/esp_rtsp_stream/` folder** with the one
    in this package, and **add `components/cctv_sdcard/`** next to it. This
    is required, not optional: the FIT/STR/CROP modes and the recording
