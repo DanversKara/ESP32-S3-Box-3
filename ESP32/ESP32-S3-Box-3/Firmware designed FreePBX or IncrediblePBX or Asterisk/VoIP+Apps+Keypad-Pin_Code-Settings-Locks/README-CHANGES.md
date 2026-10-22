@@ -1,11 +1,18 @@
-# v5.1-messages-cctv — v4 + 128 KB internal-RAM reserve + motionEye at .238
+# v6-messages-cctv — v5.1 + LVGL draw buffer cut to 25%
 
-Two changes on top of v4:
-1. `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 65536 -> 131072 (line 202) -
-   fixes the internal-DMA-RAM exhaustion behind the err-101 SD/display
-   failures and the two SIP out-of-memory crashes on 2026-10-21.
+On top of v4:
+1. `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 65536 -> 131072 (line 202).
 2. Camera URLs point at motionEye on **192.168.8.238** (the .212 in the
-   original upload is stale - flashing it left the video black). **The floating window is gone completely** — not
+   original upload is stale - flashing it left the video black).
+3. **NEW IN v6:** `lvgl: buffer_size: 25%`. Runtime verdict on the
+   reserve bump alone (v5.1, 2026-10-21 evening): NOT sufficient - the
+   spi_master "Failed to allocate priv TX buffer" / err 101 errors kept
+   firing on the CCTV grid, and the SIP out-of-memory crash recurred at
+   ~68 minutes uptime (20:39, same backtrace). The LVGL draw buffer at
+   its 100% default is 320x240x2 = 150 KB of internal DMA RAM - the
+   biggest single consumer on the box. 25% frees ~115 KB of it. The
+   reserve bump stays in; this attacks the same starved pool from the
+   consumption side. **The floating window is gone completely** — not
 hidden, removed. Everything else (VoIP, messages, lights, settings…) is
 byte-for-byte untouched.
 
@@ -62,7 +69,7 @@ byte-for-byte untouched.
 ## Install
 
 1. Back up your current device folder.
-2. Copy `v5-messages-cctv.yaml` in (keep your `secrets.yaml`).
+2. Copy `v6-messages-cctv.yaml` in (keep your `secrets.yaml`).
 3. **Replace the whole `components/esp_rtsp_stream/` folder** with the one
    in this package, and **add `components/cctv_sdcard/`** next to it. This
    is required, not optional: the FIT/STR/CROP modes and the recording
